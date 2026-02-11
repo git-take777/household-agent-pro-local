@@ -10,6 +10,20 @@ from typing import List, Dict, Optional, Tuple
 import pandas as pd
 from config import get_all_expense_categories, INCOME_CATEGORIES, get_category_group
 
+# Excel自動同期（インポートエラー時はスキップ）
+try:
+    from excel_sync import sync_expense_to_excel, sync_income_to_excel
+    EXCEL_SYNC_AVAILABLE = True
+except ImportError:
+    EXCEL_SYNC_AVAILABLE = False
+
+# Google Sheets自動同期（インポートエラー時はスキップ）
+try:
+    from google_sheets_sync import sync_expense_to_sheets, sync_income_to_sheets
+    GSHEETS_SYNC_AVAILABLE = True
+except ImportError:
+    GSHEETS_SYNC_AVAILABLE = False
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 EXPENSE_FILE = os.path.join(DATA_DIR, "expenses.json")
 INCOME_FILE = os.path.join(DATA_DIR, "incomes.json")
@@ -71,6 +85,21 @@ def add_expense(
     data = _load_json(EXPENSE_FILE)
     data.append(entry)
     _save_json(EXPENSE_FILE, data)
+
+    # Excel自動同期
+    if EXCEL_SYNC_AVAILABLE:
+        try:
+            sync_expense_to_excel(entry)
+        except Exception:
+            pass  # Excel同期失敗でもJSON保存は成功させる
+
+    # Google Sheets自動同期
+    if GSHEETS_SYNC_AVAILABLE:
+        try:
+            sync_expense_to_sheets(entry)
+        except Exception:
+            pass  # Sheets同期失敗でもJSON保存は成功させる
+
     return entry
 
 
@@ -97,6 +126,21 @@ def add_income(
     data = _load_json(INCOME_FILE)
     data.append(entry)
     _save_json(INCOME_FILE, data)
+
+    # Excel自動同期
+    if EXCEL_SYNC_AVAILABLE:
+        try:
+            sync_income_to_excel(entry)
+        except Exception:
+            pass  # Excel同期失敗でもJSON保存は成功させる
+
+    # Google Sheets自動同期
+    if GSHEETS_SYNC_AVAILABLE:
+        try:
+            sync_income_to_sheets(entry)
+        except Exception:
+            pass  # Sheets同期失敗でもJSON保存は成功させる
+
     return entry
 
 
