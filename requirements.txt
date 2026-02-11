@@ -6,3 +6,4 @@ Pillow>=10.0.0
 pytesseract>=0.3.10
 gspread>=6.0.0
 google-auth>=2.0.0
+google-cloud-vision>=3.5.0
