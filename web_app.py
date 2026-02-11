@@ -115,7 +115,7 @@ def compress_image(image_bytes, filename, max_size_kb=500, max_dimension=1600):
 
 
 # ============================================================
-#  Receipt OCR Engine
+#  Receipt OCR Engine (v2 - 改善版)
 # ============================================================
 def _check_tesseract():
     """Tesseractが利用可能かチェックする"""
@@ -130,77 +130,257 @@ def _check_tesseract():
     return False, None
 
 
-def ocr_receipt(image, filepath=None):
+def _preprocess_receipt_image(image):
     """
-    レシート画像からテキストを抽出し、
-    店舗名・日付・金額・カテゴリを推定する
-    Tesseractがない場合はファイル名ベースの簡易モードで動作
+    レシート画像の前処理 - 複数戦略を試して最良の結果を返す
+    感熱紙レシートに最適化
     """
+    from PIL import Image, ImageFilter, ImageEnhance, ImageOps
+    import numpy as np
+
+    results = []
+
+    # 元画像をグレースケールに
+    gray = image.convert("L")
+
+    # 解像度が低い場合はアップスケール（OCR精度向上）
+    w, h = gray.size
+    if max(w, h) < 1500:
+        scale = 1500 / max(w, h)
+        gray = gray.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    # --- 戦略1: コントラスト強化 + Otsu風しきい値 ---
+    try:
+        img1 = gray.copy()
+        enhancer = ImageEnhance.Contrast(img1)
+        img1 = enhancer.enhance(1.8)
+        enhancer = ImageEnhance.Sharpness(img1)
+        img1 = enhancer.enhance(1.5)
+        # ヒストグラムからOtsu風しきい値を計算
+        hist = img1.histogram()
+        pixels = np.array(hist)
+        total = pixels.sum()
+        if total > 0:
+            cumsum = np.cumsum(pixels)
+            cumsum_val = np.cumsum(pixels * np.arange(256))
+            mean_total = cumsum_val[-1] / total
+            max_var = 0
+            threshold = 128
+            for t in range(1, 255):
+                w0 = cumsum[t]
+                w1 = total - w0
+                if w0 == 0 or w1 == 0:
+                    continue
+                m0 = cumsum_val[t] / w0
+                m1 = (cumsum_val[-1] - cumsum_val[t]) / w1
+                var = w0 * w1 * (m0 - m1) ** 2
+                if var > max_var:
+                    max_var = var
+                    threshold = t
+            img1 = img1.point(lambda x: 0 if x < threshold else 255)
+        else:
+            img1 = img1.point(lambda x: 0 if x < 128 else 255)
+        results.append(("otsu", img1))
+    except Exception:
+        pass
+
+    # --- 戦略2: 適応的しきい値（ブロックごと） ---
+    try:
+        img2 = gray.copy()
+        enhancer = ImageEnhance.Contrast(img2)
+        img2 = enhancer.enhance(1.5)
+        # ガウスぼかしで局所平均を計算し、適応的二値化
+        blurred = img2.filter(ImageFilter.GaussianBlur(radius=15))
+        img2_arr = np.array(img2, dtype=np.int16)
+        blur_arr = np.array(blurred, dtype=np.int16)
+        # 局所平均より暗いピクセルを黒に
+        diff = img2_arr - blur_arr
+        binary = np.where(diff < -10, 0, 255).astype(np.uint8)
+        img2 = Image.fromarray(binary, mode="L")
+        results.append(("adaptive", img2))
+    except Exception:
+        pass
+
+    # --- 戦略3: シンプルな高コントラスト（従来の改良版） ---
+    try:
+        img3 = gray.copy()
+        enhancer = ImageEnhance.Contrast(img3)
+        img3 = enhancer.enhance(2.5)
+        enhancer = ImageEnhance.Sharpness(img3)
+        img3 = enhancer.enhance(2.0)
+        img3 = img3.point(lambda x: 0 if x < 160 else 255)
+        results.append(("simple", img3))
+    except Exception:
+        pass
+
+    # --- 戦略4: ノイズ除去 + コントラスト ---
+    try:
+        img4 = gray.copy()
+        img4 = img4.filter(ImageFilter.MedianFilter(size=3))
+        enhancer = ImageEnhance.Contrast(img4)
+        img4 = enhancer.enhance(2.0)
+        enhancer = ImageEnhance.Sharpness(img4)
+        img4 = enhancer.enhance(1.5)
+        img4 = img4.point(lambda x: 0 if x < 140 else 255)
+        results.append(("denoise", img4))
+    except Exception:
+        pass
+
+    return results if results else [("fallback", gray)]
+
+
+def _normalize_text(text):
+    """全角数字・記号を半角に正規化"""
+    # 全角数字 → 半角数字
+    table = str.maketrans(
+        "０１２３４５６７８９￥＊（）．，／−",
+        "0123456789¥*().,-/"
+    )
+    text = text.translate(table)
+    # 全角スペース → 半角
+    text = text.replace("\u3000", " ")
+    # 連続空白を1つに
+    text = re.sub(r"  +", " ", text)
+    return text
+
+
+def _ocr_with_tesseract(image):
+    """Tesseract で OCR を実行（フォールバック用）"""
     from PIL import Image, ImageFilter, ImageEnhance
     import traceback
 
-    # --- Tesseract の存在チェック ---
     tesseract_available, tesseract_path = _check_tesseract()
+    if not tesseract_available:
+        return "", "tesseract_unavailable"
 
-    text = ""
+    try:
+        import pytesseract
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+        tessdata_candidates = [
+            "/opt/homebrew/share/tessdata", "/usr/local/share/tessdata",
+            "/usr/share/tesseract-ocr/4.00/tessdata",
+            "/usr/share/tesseract-ocr/5/tessdata", "/usr/share/tessdata",
+        ]
+        for td in tessdata_candidates:
+            if os.path.isdir(td):
+                os.environ["TESSDATA_PREFIX"] = td
+                break
+
+        try:
+            available_langs = pytesseract.get_languages()
+            lang = "jpn+eng" if "jpn" in available_langs else "eng"
+        except Exception:
+            lang = "eng"
+
+        preprocessed = _preprocess_receipt_image(image)
+        best_text = ""
+        best_score = 0
+        best_strategy = ""
+
+        for strategy_name, img_processed in preprocessed:
+            for psm in [6, 4, 3]:
+                try:
+                    config = f"--oem 3 --psm {psm}"
+                    text = pytesseract.image_to_string(img_processed, lang=lang, config=config)
+                    text = _normalize_text(text)
+                    jpn_chars = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF]", text))
+                    digits = len(re.findall(r"\d", text))
+                    yen_marks = text.count("¥") + text.count("￥")
+                    has_total = 1 if re.search(r"合\s*計", text) else 0
+                    has_date = 1 if re.search(r"\d{4}[年/\-.]", text) else 0
+                    score = jpn_chars * 2 + digits + yen_marks * 5 + has_total * 50 + has_date * 30
+                    if score > best_score:
+                        best_score = score
+                        best_text = text
+                        best_strategy = f"{strategy_name}/psm{psm}"
+                except Exception:
+                    continue
+
+        return best_text, f"tesseract ({lang}, {best_strategy})"
+    except Exception as e:
+        return "", f"tesseract_error: {e}"
+
+
+def ocr_receipt(image, filepath=None, image_bytes=None):
+    """
+    レシート画像からテキストを抽出し、
+    店舗名・日付・金額・カテゴリ・決済方法を推定する
+
+    優先順位:
+      1. Google Cloud Vision API（月1,000回無料）
+      2. Tesseract OCR（フォールバック）
+      3. 簡易モード（OCRなし）
+    """
+    import traceback
+
+    best_text = ""
     ocr_method = "none"
     ocr_error = ""
+    vision_usage = None
 
-    if tesseract_available:
-        try:
-            import pytesseract
+    # === 1. Google Cloud Vision API を試す ===
+    try:
+        from vision_ocr import vision_ocr_image, get_usage_status, check_vision_api
 
-            if tesseract_path:
-                pytesseract.pytesseract.tesseract_cmd = tesseract_path
+        api_check = check_vision_api()
+        if api_check["available"]:
+            usage_status = get_usage_status()
 
-            # tessdataパスを自動検出
-            tessdata_candidates = [
-                "/opt/homebrew/share/tessdata",
-                "/usr/local/share/tessdata",
-                "/usr/share/tesseract-ocr/4.00/tessdata",
-                "/usr/share/tesseract-ocr/5/tessdata",
-                "/usr/share/tessdata",
-            ]
-            for td in tessdata_candidates:
-                if os.path.isdir(td):
-                    os.environ["TESSDATA_PREFIX"] = td
-                    break
+            if not usage_status["blocked"]:
+                # image_bytes が渡されていない場合は image から生成
+                if image_bytes is None and filepath:
+                    with open(filepath, "rb") as f:
+                        image_bytes = f.read()
+                elif image_bytes is None:
+                    buf = io.BytesIO()
+                    image.save(buf, format="JPEG", quality=90)
+                    image_bytes = buf.getvalue()
 
-            # 前処理: コントラスト強化 + シャープ化 + グレースケール
-            img_processed = image.convert("L")
-            enhancer = ImageEnhance.Contrast(img_processed)
-            img_processed = enhancer.enhance(2.0)
-            enhancer = ImageEnhance.Sharpness(img_processed)
-            img_processed = enhancer.enhance(2.0)
-            img_processed = img_processed.point(lambda x: 0 if x < 140 else 255)
+                vision_result = vision_ocr_image(image_bytes)
+                vision_usage = vision_result.get("usage")
 
-            # OCR実行
-            # jpn があれば日本語+英語、なければ英語のみ
-            try:
-                available_langs = pytesseract.get_languages()
-                lang = "jpn+eng" if "jpn" in available_langs else "eng"
-            except Exception:
-                lang = "eng"
+                if vision_result["success"] and vision_result["text"].strip():
+                    best_text = _normalize_text(vision_result["text"])
+                    ocr_method = "Google Cloud Vision API"
 
-            custom_config = r"--oem 3 --psm 6"
-            text = pytesseract.image_to_string(img_processed, lang=lang, config=custom_config)
-            ocr_method = f"tesseract ({lang})"
+                    # 使用量警告をエラー欄に表示
+                    if vision_usage and vision_usage.get("warning"):
+                        ocr_error = vision_usage["message"]
+                elif vision_result.get("fallback_to_tesseract"):
+                    ocr_error = vision_result.get("error", "")
+                    # → Tesseract にフォールバック
+            else:
+                ocr_error = usage_status["message"]
+                vision_usage = usage_status
+                # → Tesseract にフォールバック
+    except ImportError:
+        pass  # vision_ocr モジュールがない → Tesseract にフォールバック
+    except Exception as e:
+        ocr_error = f"Vision API エラー: {e}"
 
-        except Exception as e:
-            ocr_error = f"Tesseractエラー: {e}\n{traceback.format_exc()}"
-            text = ""
-    else:
-        ocr_error = (
-            "Tesseract OCRが見つかりません。\n"
-            "インストール方法:\n"
-            "  brew install tesseract\n"
-            "  brew install tesseract-lang  (日本語対応)\n\n"
-            "現在は画像情報のみで簡易解析を行います。"
-        )
+    # === 2. Tesseract OCR フォールバック ===
+    if not best_text.strip():
+        tess_text, tess_method = _ocr_with_tesseract(image)
+        if tess_text.strip():
+            best_text = tess_text
+            if "Vision" not in ocr_method:
+                ocr_method = tess_method
+            else:
+                ocr_method = f"{tess_method} (Vision API フォールバック)"
 
-    # テキストが取れなかった場合 → 簡易モード（画像情報 + ファイル名から推定）
-    if not text.strip():
+    # === 3. テキストが取れなかった場合 → 簡易モード ===
+    if not best_text.strip():
         ocr_method = "簡易モード（OCRなし）"
+        err_parts = []
+        if ocr_error:
+            err_parts.append(ocr_error)
+        if not _check_tesseract()[0]:
+            err_parts.append(
+                "Tesseract OCRも見つかりません。\n"
+                "  brew install tesseract && brew install tesseract-lang"
+            )
         result = {
             "store_name": "",
             "date": date.today().strftime("%Y-%m-%d"),
@@ -208,13 +388,13 @@ def ocr_receipt(image, filepath=None):
             "total": 0,
             "category_guess": "食費",
             "payment_method": "",
-            "raw_text": f"[OCRテキストなし]\n\n{ocr_error}" if ocr_error else "[OCRテキストなし]",
+            "raw_text": "[OCRテキストなし]\n\n" + "\n".join(err_parts) if err_parts else "[OCRテキストなし]",
             "success": True,
             "ocr_method": ocr_method,
-            "ocr_error": ocr_error,
+            "ocr_error": "\n".join(err_parts),
             "needs_manual_input": True,
+            "vision_usage": vision_usage,
         }
-        # ファイル名から店名を推定
         if filepath:
             fname = os.path.basename(filepath).lower()
             for key, name in [("seven", "セブンイレブン"), ("lawson", "ローソン"),
@@ -224,19 +404,28 @@ def ocr_receipt(image, filepath=None):
                     break
         return result
 
-    # テキストからレシート情報を抽出
-    result = parse_receipt_ocr(text)
-    result["raw_text"] = text
+    # === テキストからレシート情報を抽出 ===
+    result = parse_receipt_ocr(best_text)
+    result["raw_text"] = best_text
     result["success"] = True
     result["ocr_method"] = ocr_method
-    result["ocr_error"] = ""
+    result["ocr_error"] = ocr_error
     result["needs_manual_input"] = False
+    result["vision_usage"] = vision_usage
 
     return result
 
 
 def parse_receipt_ocr(text):
-    """OCRテキストからレシート情報を解析"""
+    """
+    OCRテキストからレシート情報を解析 (v2 - 改善版)
+    - 日本語店名の直接マッチング
+    - 年月日形式の日付対応
+    - 全角文字正規化
+    - 日本語決済手段対応
+    """
+    # 全角正規化
+    text = _normalize_text(text)
     lines = [line.strip() for line in text.split("\n") if line.strip()]
 
     result = {
@@ -248,189 +437,510 @@ def parse_receipt_ocr(text):
         "payment_method": "",
     }
 
-    # --- 店舗名の推定 (最初の数行から) ---
-    store_keywords = {
-        # スーパー・コンビニ
-        "seven": "セブンイレブン", "7-eleven": "セブンイレブン", "7-11": "セブンイレブン",
-        "lawson": "ローソン", "familymart": "ファミリーマート", "family mart": "ファミリーマート",
-        "ministop": "ミニストップ", "daily": "デイリーヤマザキ",
-        "aeon": "イオン", "daiei": "ダイエー", "ito-yokado": "イトーヨーカドー",
-        "seiyu": "西友", "life": "ライフ", "maruetsu": "マルエツ",
-        "summit": "サミット", "ok": "オーケー", "gyomu": "業務スーパー",
-        "costco": "コストコ", "donki": "ドン・キホーテ", "don quijote": "ドン・キホーテ",
+    # ==============================================
+    # 1. 店舗名の推定（日本語キーワード優先）
+    # ==============================================
+    # 日本語の店名キーワード（テキスト全体から検索）
+    jp_store_keywords = {
+        # スーパー・食料品
+        "生鮮市場": "生鮮市場", "業務スーパー": "業務スーパー",
+        "イオン": "イオン", "西友": "西友", "ライフ": "ライフ",
+        "マルエツ": "マルエツ", "サミット": "サミット",
+        "オーケー": "オーケー", "コストコ": "コストコ",
+        "いなげや": "いなげや", "ヤオコー": "ヤオコー",
+        "ベイシア": "ベイシア", "バロー": "バロー",
+        "万代": "万代", "フレスコ": "フレスコ",
+        "成城石井": "成城石井", "紀ノ国屋": "紀ノ国屋",
+        "まいばすけっと": "まいばすけっと",
+        "イトーヨーカドー": "イトーヨーカドー",
+        # コンビニ
+        "セブン-イレブン": "セブンイレブン", "セブンイレブン": "セブンイレブン",
+        "ファミリーマート": "ファミリーマート", "ローソン": "ローソン",
+        "ミニストップ": "ミニストップ", "デイリーヤマザキ": "デイリーヤマザキ",
+        "セイコーマート": "セイコーマート", "ポプラ": "ポプラ",
+        # 飲食店
+        "三浦のハンバーグ": "三浦のハンバーグ",
+        "タリーズ": "タリーズコーヒー", "tully": "タリーズコーヒー",
+        "スターバックス": "スターバックス", "starbucks": "スターバックス",
+        "ドトール": "ドトール", "コメダ": "コメダ珈琲",
+        "サンマルク": "サンマルクカフェ", "ベローチェ": "ベローチェ",
+        "マクドナルド": "マクドナルド", "mcdonald": "マクドナルド",
+        "モスバーガー": "モスバーガー", "バーガーキング": "バーガーキング",
+        "すき家": "すき家", "吉野家": "吉野家", "松屋": "松屋",
+        "ガスト": "ガスト", "サイゼリヤ": "サイゼリヤ",
+        "ジョナサン": "ジョナサン", "デニーズ": "デニーズ",
+        "ココス": "ココス", "ロイヤルホスト": "ロイヤルホスト",
+        "大戸屋": "大戸屋", "やよい軒": "やよい軒",
+        "丸亀製麺": "丸亀製麺", "はなまるうどん": "はなまるうどん",
+        "天下一品": "天下一品", "一蘭": "一蘭", "一風堂": "一風堂",
+        "日高屋": "日高屋", "幸楽苑": "幸楽苑",
+        "餃子の王将": "餃子の王将", "リンガーハット": "リンガーハット",
+        "CoCo壱番屋": "CoCo壱番屋", "かつや": "かつや",
+        "新時代": "新時代", "鳥貴族": "鳥貴族",
+        "串カツ田中": "串カツ田中", "和民": "和民",
+        "魚民": "魚民", "白木屋": "白木屋",
         # ドラッグストア
-        "matsukiyo": "マツモトキヨシ", "welcia": "ウエルシア", "sundrug": "サンドラッグ",
-        "tsuruha": "ツルハ", "cocokara": "ココカラファイン",
+        "マツモトキヨシ": "マツモトキヨシ", "ウエルシア": "ウエルシア",
+        "サンドラッグ": "サンドラッグ", "ツルハ": "ツルハドラッグ",
+        "ココカラファイン": "ココカラファイン", "スギ薬局": "スギ薬局",
+        "クリエイト": "クリエイトSD",
+        # ドン・キホーテ
+        "ドン・キホーテ": "ドン・キホーテ", "ドンキ": "ドン・キホーテ",
+        "don quijote": "ドン・キホーテ",
         # 家電
-        "yamada": "ヤマダ電機", "bic": "ビックカメラ", "yodobashi": "ヨドバシカメラ",
-        "edion": "エディオン", "kojima": "コジマ",
-        # レストラン等
-        "mcdonald": "マクドナルド", "starbucks": "スターバックス",
-        "sukiya": "すき家", "matsuya": "松屋", "yoshinoya": "吉野家",
-        "gusto": "ガスト", "saizeriya": "サイゼリヤ", "denny": "デニーズ",
-        # 交通
-        "jr": "JR", "suica": "Suica", "pasmo": "PASMO",
-        # 決済
-        "paypay": "PayPay", "linepay": "LINE Pay", "rakuten": "楽天",
+        "ヤマダ電機": "ヤマダ電機", "ビックカメラ": "ビックカメラ",
+        "ヨドバシ": "ヨドバシカメラ", "エディオン": "エディオン",
+        "ケーズデンキ": "ケーズデンキ", "ノジマ": "ノジマ",
+        # 衣料
+        "ユニクロ": "ユニクロ", "uniqlo": "ユニクロ",
+        "GU": "GU", "しまむら": "しまむら",
+        "H&M": "H&M", "ZARA": "ZARA",
+        # 100円ショップ
+        "ダイソー": "ダイソー", "セリア": "セリア",
+        "キャンドゥ": "キャンドゥ",
+        # ホームセンター
+        "カインズ": "カインズ", "コーナン": "コーナン",
+        "ニトリ": "ニトリ", "無印良品": "無印良品",
     }
 
-    for line in lines[:5]:
-        lower = line.lower()
-        for key, name in store_keywords.items():
-            if key in lower:
+    # 英語キーワード（小文字マッチ）
+    en_store_keywords = {
+        "seven": "セブンイレブン", "7-eleven": "セブンイレブン", "7-11": "セブンイレブン",
+        "lawson": "ローソン", "familymart": "ファミリーマート",
+        "aeon": "イオン", "costco": "コストコ",
+        "fresh food": "生鮮市場",
+    }
+
+    # まず全テキストから日本語店名を検索（長いキーワードを優先）
+    text_for_store = "\n".join(lines[:10])
+    found_stores = []
+    for key, name in sorted(jp_store_keywords.items(), key=lambda x: len(x[0]), reverse=True):
+        if key in text_for_store:
+            found_stores.append((text_for_store.index(key), name, key))
+    if found_stores:
+        # テキスト中の出現位置が最も早いものを採用
+        found_stores.sort(key=lambda x: x[0])
+        base_name = found_stores[0][1]
+        result["store_name"] = base_name
+        # 支店名も取得試行
+        match_key = found_stores[0][2]
+        branch_found = False
+        for i, line in enumerate(lines[:10]):
+            if match_key in line:
+                # 同じ行に支店名があれば追加（例: "三浦のハンバーグ池袋店"）
+                after = line.split(match_key)[-1].strip()
+                if after and len(after) <= 20 and not re.match(r"^[\d\s]+$", after):
+                    # 店名の一部が重複しないようチェック
+                    if after not in base_name and base_name not in after:
+                        result["store_name"] = base_name + " " + after
+                    elif "店" in after and "店" not in base_name:
+                        result["store_name"] = base_name + " " + after
+                    branch_found = True
+                # 次の行に支店名がある場合（例: "業務スーパー" 改行 "六角橋店"）
+                if not branch_found and i + 1 < len(lines[:10]):
+                    next_line = lines[i + 1].strip()
+                    if re.search(r".+店$", next_line) and len(next_line) <= 20:
+                        result["store_name"] = base_name + " " + next_line
+                        branch_found = True
+                break
+
+    # 英語キーワード検索
+    if not result["store_name"]:
+        text_lower_store = text_for_store.lower()
+        for key, name in en_store_keywords.items():
+            if key in text_lower_store:
                 result["store_name"] = name
                 break
-        if result["store_name"]:
+
+    # フォールバック: 最初の非数字行を店名とする
+    if not result["store_name"] and lines:
+        for line in lines[:5]:
+            # 電話番号、登録番号、日付のみの行はスキップ
+            if re.match(r"^[\d\s\-/:.TELtelFAXfax#＃T※]+$", line):
+                continue
+            if re.match(r"^(登録番号|レジ|TEL|FAX|電話)", line):
+                continue
+            if len(line) <= 2:
+                continue
+            result["store_name"] = line[:30]
             break
 
-    if not result["store_name"] and lines:
-        # 最初の行を店舗名として扱う (数字でなければ)
-        first_line = lines[0]
-        if not re.match(r"^[\d\s\-/:.]+$", first_line):
-            result["store_name"] = first_line[:30]
+    # 支店名を別の行から補完
+    if result["store_name"] and "店" not in result["store_name"]:
+        base = result["store_name"]
+        for line in lines[:10]:
+            stripped = line.strip()
+            if re.search(r".+店$", stripped) and len(stripped) <= 20:
+                if stripped != base:
+                    # 基本店名がstrippedに含まれている場合は、支店部分のみ抽出
+                    if base in stripped:
+                        branch_part = stripped.replace(base, "").strip()
+                        if branch_part:
+                            result["store_name"] = base + " " + branch_part
+                    else:
+                        result["store_name"] = base + " " + stripped
+                    break
 
-    # --- 日付の抽出 ---
+    # ==============================================
+    # 2. 日付の抽出（年月日形式を最優先）
+    # ==============================================
     date_patterns = [
-        r"(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})",          # 2026/02/11
-        r"(\d{2})[/\-.](\d{1,2})[/\-.](\d{1,2})",          # 26/02/11
-        r"R(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{1,2})",       # R8/02/11 (令和)
+        # 2026年2月8日 / 2026年02月10日
+        (r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", "nen"),
+        # 2026/02/11 / 2026-02-11 / 2026.02.11
+        (r"(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})", "slash"),
+        # R8.02.11 / R8/02/11 (令和)
+        (r"[RＲ]\s*(\d{1,2})\s*[/\-.年]\s*(\d{1,2})\s*[/\-.月]\s*(\d{1,2})", "reiwa"),
+        # 令和8年2月11日
+        (r"令和\s*(\d{1,2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", "reiwa_kanji"),
+        # 26/02/11
+        (r"(?<!\d)(\d{2})[/\-.](\d{1,2})[/\-.](\d{1,2})(?!\d)", "yy"),
     ]
+
     for line in lines:
-        for i, pattern in enumerate(date_patterns):
+        if result["date"]:
+            break
+        for pattern, ptype in date_patterns:
             match = re.search(pattern, line)
             if match:
                 groups = match.groups()
-                if i == 0:  # YYYY/MM/DD
-                    y, m, d = int(groups[0]), int(groups[1]), int(groups[2])
-                elif i == 1:  # YY/MM/DD
-                    y = int(groups[0])
-                    y = y + 2000 if y < 50 else y + 1900
-                    m, d = int(groups[1]), int(groups[2])
-                elif i == 2:  # 令和
-                    y = int(groups[0]) + 2018
-                    m, d = int(groups[1]), int(groups[2])
-
                 try:
-                    result["date"] = f"{y}-{m:02d}-{d:02d}"
-                    datetime.strptime(result["date"], "%Y-%m-%d")
-                    break
-                except ValueError:
-                    result["date"] = ""
-        if result["date"]:
-            break
+                    if ptype == "nen" or ptype == "slash":
+                        y, m, d = int(groups[0]), int(groups[1]), int(groups[2])
+                        # 登録番号 T2020... などの誤検出を防止
+                        if y < 2000 or y > 2100:
+                            continue
+                    elif ptype == "reiwa" or ptype == "reiwa_kanji":
+                        y = int(groups[0]) + 2018
+                        m, d = int(groups[1]), int(groups[2])
+                    elif ptype == "yy":
+                        y = int(groups[0])
+                        y = y + 2000 if y < 50 else y + 1900
+                        m, d = int(groups[1]), int(groups[2])
+                    else:
+                        continue
+
+                    # 日付の妥当性チェック
+                    if 1 <= m <= 12 and 1 <= d <= 31:
+                        test_date = f"{y}-{m:02d}-{d:02d}"
+                        datetime.strptime(test_date, "%Y-%m-%d")
+                        result["date"] = test_date
+                        break
+                except (ValueError, IndexError):
+                    continue
 
     if not result["date"]:
         result["date"] = date.today().strftime("%Y-%m-%d")
 
-    # --- 金額の抽出 ---
-    amounts = []
-    total_keywords = ["total", "合計", "小計", "税込", "taxincl", "sum", "ttl", "お支払"]
-    item_pattern = re.compile(r"(.+?)\s+[¥\\]?\s*(\d[\d,]*)\s*$")
+    # ==============================================
+    # 3. 金額の抽出（改善版）
+    # ==============================================
+    result["line_items"] = []
 
-    for line in lines:
-        # 品目 + 金額のパターン
-        m = item_pattern.match(line)
-        if m:
-            name = m.group(1).strip()
-            try:
-                amount = int(m.group(2).replace(",", ""))
-                if 1 <= amount <= 999999:
-                    amounts.append(amount)
-                    result["line_items"].append({"name": name, "amount": amount})
-            except ValueError:
-                pass
+    # 合計キーワード（スペース入り・全角対応）
+    total_keywords = [
+        "合計", "合 計", "合　計", "合言十", "合訂",  # OCR誤読対応
+        "お支払", "お支払い", "税込合計", "請求額",
+        "total", "TOTAL", "ttl",
+    ]
+    subtotal_keywords = ["小計", "小 計"]
+    skip_keywords = [
+        "お釣", "おつり", "お預", "預り", "お預り",
+        "点数", "買上点数", "商品点数",
+        "ポイント", "税率", "対象額", "税等", "消費税",
+        "内税", "外税", "軽減", "8%", "10%",
+        "登録番号", "取引", "電話", "TEL", "FAX",
+        # 決済方法キーワード（品目と間違えないため）
+        "コード決済", "楽天ペイ", "PayPay", "paypay", "LINE Pay",
+        "メルペイ", "d払い", "au PAY", "電子マネー", "楽天ポイント",
+        "クレジット", "VISA", "Mastercard", "JCB", "AMEX",
+        "Suica", "PASMO", "nanaco", "WAON", "現金",
+    ]
 
-        # 数字のみの行からも金額抽出
-        nums = re.findall(r"[¥\\]?\s*(\d[\d,]*)", line)
-        for n in nums:
-            try:
-                val = int(n.replace(",", ""))
-                if val not in amounts and 1 <= val <= 999999:
-                    amounts.append(val)
-            except ValueError:
-                pass
+    # ¥マーク付き金額パターン
+    yen_pattern = re.compile(r"[¥￥\\]\s*([0-9][0-9,]*)")
+    # 行末の金額パターン
+    line_amount_pattern = re.compile(r"(.+?)\s+[¥￥\\]?\s*([0-9][0-9,]*)\s*$")
+    # 割引パターン
+    discount_pattern = re.compile(r"[-ー−]\s*([0-9][0-9,]*)")
 
-    # 合計の推定: 「合計」キーワード近くの金額 or 最大金額
+    # 合計金額の検出（最優先）
+    # 優先度:
+    #   P1: 「税込合計」「合計(税込)」 + ¥金額
+    #   P2: 「合計」(小計以外) + ¥金額
+    #   P3: 「お支払」「請求額」 + ¥金額
+    #   P4: 「合計」 + 金額（¥なし）
+    #   P5: 「小計」 + ¥金額
+    #   ※ 同じ優先度なら後（下の行）に出たものを採用
     total_found = False
+    total_candidates = []
+
+    # 優先度付きキーワード
+    priority_keywords = [
+        (1, ["税込合計", "税込 合計", "合計(税込)", "合計（税込）"]),
+        (2, ["合計", "合 計", "合　計", "合言十", "合訂"]),
+        (3, ["お支払", "お支払い", "請求額", "total", "TOTAL"]),
+        (5, ["小計", "小 計"]),
+    ]
+
     for line in lines:
-        lower = line.lower()
-        if any(kw in lower for kw in total_keywords):
+        # スキップ対象行（ただし合計キーワードを含む行は除外しない）
+        is_total_line = any(kw in line for kw in total_keywords)
+        if any(kw in line for kw in skip_keywords) and not is_total_line:
+            continue
+
+        if not is_total_line:
+            continue
+
+        # この行のキーワード優先度を決定
+        line_priority = 99
+        for pri, kws in priority_keywords:
+            if any(kw in line for kw in kws):
+                # 「小計」が含まれる場合、「合計」でも「小計」扱い
+                if pri == 2 and any(sk in line for sk in ["小計", "小 計"]):
+                    line_priority = min(line_priority, 5)
+                else:
+                    line_priority = min(line_priority, pri)
+                break
+
+        # ¥付き金額を探す
+        yen_matches = yen_pattern.findall(line)
+        if yen_matches:
+            for m in yen_matches:
+                try:
+                    val = int(m.replace(",", ""))
+                    if 10 <= val <= 999999:
+                        total_candidates.append((line_priority, "yen", val, line))
+                except ValueError:
+                    pass
+        else:
+            # 数字のみの抽出（¥なし）
             nums = re.findall(r"(\d[\d,]*)", line)
             for n in nums:
                 try:
                     val = int(n.replace(",", ""))
                     if 10 <= val <= 999999:
-                        result["total"] = val
-                        total_found = True
-                        break
+                        # ¥なしは優先度を+10して区別
+                        total_candidates.append((line_priority + 10, "num", val, line))
                 except ValueError:
                     pass
-            if total_found:
-                break
 
-    if not total_found and amounts:
-        result["total"] = max(amounts)
+    # 合計候補から最適なものを選択
+    # 最も優先度が高い（数字が小さい）ものを採用。同優先度なら最後のもの
+    if total_candidates:
+        best_priority = min(c[0] for c in total_candidates)
+        best_candidates = [c for c in total_candidates if c[0] == best_priority]
+        # 同優先度の中で最後のものを採用（レシートは下に行くほど最終合計）
+        _, _, best_val, _ = best_candidates[-1]
+        result["total"] = best_val
+        total_found = True
 
-    # --- カテゴリ推定 ---
+    # 品目の抽出
+    for line in lines:
+        # スキップ行（合計・小計・税・お釣りなど）
+        if any(kw in line for kw in total_keywords + subtotal_keywords + skip_keywords):
+            continue
+        # 純粋な数字のみの行をスキップ（レシート番号など）
+        if re.match(r"^[\d\s,.\-/:#PpTt]+$", line):
+            continue
+        # バーコード・登録番号行をスキップ
+        if re.match(r"^[PT]\d{10,}", line):
+            continue
+        # 括弧で始まる補足行をスキップ（「(2個 x @238)」など）
+        if re.match(r"^\s*[（(]", line):
+            continue
+        # 割引行
+        if re.match(r"^\s*割引", line):
+            dm = discount_pattern.search(line)
+            if dm:
+                try:
+                    discount_val = int(dm.group(1).replace(",", ""))
+                    if discount_val > 0 and result["line_items"]:
+                        result["line_items"].append({"name": "割引", "amount": -discount_val})
+                except ValueError:
+                    pass
+            continue
+
+        # 品目 + ¥金額パターン
+        m = line_amount_pattern.match(line)
+        if m:
+            name = m.group(1).strip()
+            # 品目名のクリーニング（先頭の内8, ※, コードなど除去）
+            name = re.sub(r"^(内\d+\s*|※\s*|\*\s*)", "", name)
+            name = re.sub(r"^\d{4}\s+", "", name)  # 先頭4桁コード除去
+            name = name.strip()
+            # 品目名が数字のみの場合はスキップ
+            if re.match(r"^[\d\s,]+$", name):
+                continue
+            try:
+                amount = int(m.group(2).replace(",", ""))
+                if name and 1 <= amount <= 999999 and len(name) >= 2:
+                    result["line_items"].append({"name": name, "amount": amount})
+            except ValueError:
+                pass
+
+    # 合計がなければ品目合計 or 最大金額
+    if not total_found:
+        if result["line_items"]:
+            positive_items = [it["amount"] for it in result["line_items"] if it["amount"] > 0]
+            if positive_items:
+                result["total"] = sum(positive_items)
+        else:
+            # テキスト全体から¥付き金額を収集し最大値
+            all_amounts = []
+            for line in lines:
+                for m in yen_pattern.finditer(line):
+                    try:
+                        val = int(m.group(1).replace(",", ""))
+                        if 10 <= val <= 999999:
+                            all_amounts.append(val)
+                    except ValueError:
+                        pass
+            if all_amounts:
+                result["total"] = max(all_amounts)
+
+    # ==============================================
+    # 4. カテゴリ推定（店名 → テキスト内容）
+    # ==============================================
+    store_name = result["store_name"]
     text_lower = text.lower()
-    category_patterns = {
-        "食費": ["food", "grocery", "スーパー", "コンビニ", "弁当", "おにぎり",
-                  "パン", "飲料", "meat", "fish", "vegetable", "rice", "milk",
-                  "マクドナルド", "restaurant", "cafe", "coffee", "lunch", "dinner"],
-        "日用品": ["drug", "pharmacy", "洗剤", "shampoo", "soap", "tissue",
-                   "paper", "cleaning", "ドラッグ", "日用"],
-        "交通費": ["jr", "suica", "pasmo", "train", "bus", "taxi", "gas",
-                   "parking", "toll", "駐車"],
-        "医療費": ["hospital", "clinic", "pharmacy", "medicine", "doctor",
-                   "医療", "薬", "処方"],
-        "衣服費": ["cloth", "fashion", "wear", "shoes", "uniqlo", "gu ",
-                   "zara", "h&m", "衣"],
-        "娯楽費": ["movie", "game", "book", "amazon", "entertainment",
-                   "hobby", "映画", "ゲーム"],
-        "美容費": ["beauty", "salon", "hair", "cosmetic", "nail", "美容"],
-        "光熱費": ["electric", "gas bill", "water bill", "電気", "ガス", "水道"],
-        "通信費": ["phone", "mobile", "internet", "wifi", "au ", "docomo",
-                   "softbank"],
-        "家電購入": ["electronics", "appliance", "camera", "pc", "yamada",
-                    "bic", "yodobashi", "家電"],
-    }
 
-    best_category = "食費"
-    best_score = 0
-    for cat, keywords in category_patterns.items():
-        score = sum(1 for kw in keywords if kw in text_lower)
-        if score > best_score:
-            best_score = score
-            best_category = cat
-
-    # 店舗名からもカテゴリ推定
-    store = result["store_name"].lower()
+    # 店名ベースカテゴリ（優先）
     store_category_map = {
-        "セブン": "食費", "ローソン": "食費", "ファミリ": "食費",
-        "イオン": "食費", "西友": "食費", "ライフ": "食費",
-        "マツモト": "日用品", "ウエルシア": "日用品", "サンドラッグ": "日用品",
-        "ヤマダ": "家電購入", "ビック": "家電購入", "ヨドバシ": "家電購入",
-        "マクドナルド": "食費", "スターバックス": "食費",
+        # 食品スーパー
+        "生鮮市場": "食費", "業務スーパー": "食費", "イオン": "食費",
+        "西友": "食費", "ライフ": "食費", "マルエツ": "食費",
+        "サミット": "食費", "オーケー": "食費", "コストコ": "食費",
+        "成城石井": "食費", "まいばすけっと": "食費",
+        "イトーヨーカドー": "食費",
+        # コンビニ
+        "セブンイレブン": "食費", "ローソン": "食費", "ファミリーマート": "食費",
+        "ミニストップ": "食費",
+        # 外食
+        "三浦のハンバーグ": "外食費", "タリーズ": "外食費",
+        "スターバックス": "外食費", "ドトール": "外食費",
+        "コメダ": "外食費", "マクドナルド": "外食費",
+        "すき家": "外食費", "吉野家": "外食費", "松屋": "外食費",
+        "ガスト": "外食費", "サイゼリヤ": "外食費",
+        "大戸屋": "外食費", "やよい軒": "外食費",
+        "新時代": "外食費", "鳥貴族": "外食費",
+        "日高屋": "外食費", "一蘭": "外食費",
+        # ドラッグストア
+        "マツモトキヨシ": "日用品", "ウエルシア": "日用品",
+        "サンドラッグ": "日用品", "ツルハ": "日用品",
+        "ココカラファイン": "日用品", "スギ薬局": "日用品",
+        # 家電
+        "ヤマダ電機": "家電購入", "ビックカメラ": "家電購入",
+        "ヨドバシ": "家電購入", "エディオン": "家電購入",
+        "ケーズデンキ": "家電購入",
+        # 衣料
+        "ユニクロ": "衣服費", "GU": "衣服費", "しまむら": "衣服費",
+        "H&M": "衣服費", "ZARA": "衣服費",
+        # ドン・キホーテ
         "ドン・キホーテ": "日用品",
+        # 100均
+        "ダイソー": "日用品", "セリア": "日用品", "キャンドゥ": "日用品",
+        # 家具
+        "ニトリ": "日用品", "無印良品": "日用品",
     }
+
+    category_set = False
     for key, cat in store_category_map.items():
-        if key in result["store_name"]:
+        if key in store_name:
             result["category_guess"] = cat
+            category_set = True
             break
-    else:
+
+    if not category_set:
+        # テキスト内容からカテゴリ推定
+        category_patterns = {
+            "食費": ["food", "grocery", "スーパー", "コンビニ", "弁当", "おにぎり",
+                      "パン", "飲料", "meat", "fish", "vegetable", "rice", "milk",
+                      "鮮魚", "青果", "精肉", "惣菜", "生鮮"],
+            "外食費": ["restaurant", "cafe", "coffee", "lunch", "dinner",
+                       "ランチ", "ディナー", "カフェ", "コーヒー", "居酒屋",
+                       "ハンバーグ", "ラーメン", "うどん", "そば", "寿司"],
+            "日用品": ["drug", "pharmacy", "洗剤", "shampoo", "soap", "tissue",
+                       "paper", "cleaning", "ドラッグ", "日用", "ティッシュ"],
+            "交通費": ["jr", "suica", "pasmo", "train", "bus", "taxi",
+                       "parking", "toll", "駐車", "鉄道", "電車", "バス"],
+            "医療費": ["hospital", "clinic", "medicine", "doctor",
+                       "医療", "薬", "処方", "診療"],
+            "衣服費": ["cloth", "fashion", "wear", "shoes",
+                       "衣", "服", "靴", "ファッション"],
+            "娯楽費": ["movie", "game", "book", "entertainment",
+                       "hobby", "映画", "ゲーム", "書籍"],
+            "美容費": ["beauty", "salon", "hair", "cosmetic", "nail", "美容"],
+            "光熱費": ["electric", "gas", "water", "電気", "ガス", "水道"],
+            "通信費": ["phone", "mobile", "internet", "wifi", "docomo",
+                       "softbank", "au ", "携帯", "通信"],
+            "家電購入": ["electronics", "appliance", "camera", "家電"],
+        }
+
+        best_category = "食費"
+        best_score = 0
+        for cat, keywords in category_patterns.items():
+            score = sum(1 for kw in keywords if kw in text_lower)
+            if score > best_score:
+                best_score = score
+                best_category = cat
+
         result["category_guess"] = best_category
 
-    # --- 決済方法の推定 ---
-    payment_keywords = {
-        "cash": "現金", "credit": "クレジット", "card": "カード",
-        "paypay": "PayPay", "linepay": "LINE Pay", "suica": "Suica",
-        "pasmo": "PASMO", "id ": "iD", "quicpay": "QUICPay",
-        "visa": "VISA", "master": "Mastercard", "amex": "AMEX",
-    }
-    for kw, method in payment_keywords.items():
-        if kw in text_lower:
-            result["payment_method"] = method
-            break
+    # ==============================================
+    # 5. 決済方法の推定（日本語キーワード優先）
+    # ==============================================
+    # 決済キーワードとパターン（金額付きの行から優先検出）
+    payment_line_patterns = [
+        (r"コード決済", "コード決済"),
+        (r"楽天ペイ", "楽天ペイ"),
+        (r"楽天pay", "楽天ペイ"),
+        (r"PayPay|paypay|ペイペイ", "PayPay"),
+        (r"LINE\s*Pay|linepay|ラインペイ", "LINE Pay"),
+        (r"メルペイ", "メルペイ"),
+        (r"d払い|ｄ払い", "d払い"),
+        (r"au\s*PAY|auペイ", "au PAY"),
+        (r"楽天ポイント", "楽天ポイント"),
+        (r"電子マネー", "電子マネー"),
+        (r"(?:クレジット|CREDIT)", "クレジットカード"),
+        (r"(?:VISA|Visa|visa)", "VISA"),
+        (r"(?:Mastercard|mastercard|MASTER)", "Mastercard"),
+        (r"(?:JCB|jcb)", "JCB"),
+        (r"(?:AMEX|amex|アメックス)", "AMEX"),
+        (r"Suica|suica|スイカ", "Suica"),
+        (r"PASMO|pasmo|パスモ", "PASMO"),
+        (r"(?:^|\s)iD(?:\s|$)", "iD"),
+        (r"QUICPay|quicpay|クイックペイ", "QUICPay"),
+        (r"nanaco|ナナコ", "nanaco"),
+        (r"WAON|waon|ワオン", "WAON"),
+        (r"お預り|お預かり|預り金", "現金"),
+        (r"現金", "現金"),
+    ]
+
+    # 決済方法を金額付きで検出し、最大金額のものを採用
+    payment_candidates = []
+    for line in lines:
+        for pattern, method in payment_line_patterns:
+            if re.search(pattern, line):
+                # この行の¥金額を取得
+                yen_m = re.findall(r"[¥￥]\s*([0-9][0-9,]*)", line)
+                amount = 0
+                if yen_m:
+                    try:
+                        amount = int(yen_m[0].replace(",", ""))
+                    except ValueError:
+                        pass
+                payment_candidates.append((method, amount))
+                break
+
+    if payment_candidates:
+        # 金額が最大の決済方法を採用（0の場合は最初にマッチしたもの）
+        with_amount = [(m, a) for m, a in payment_candidates if a > 0]
+        if with_amount:
+            best_payment = max(with_amount, key=lambda x: x[1])
+            result["payment_method"] = best_payment[0]
+        else:
+            result["payment_method"] = payment_candidates[0][0]
 
     return result
 
@@ -1201,7 +1711,7 @@ def receipt_page():
                 # Step 4: OCR実行
                 if compression_info and not error_detail:
                     try:
-                        ocr_result = ocr_receipt(comp["image"], save_path)
+                        ocr_result = ocr_receipt(comp["image"], save_path, image_bytes=comp["bytes"])
                         ocr_result["saved_path"] = save_path if save_path else ""
                         ocr_result["saved_name"] = save_name if save_path else ""
                     except Exception as e:
@@ -1273,6 +1783,30 @@ def receipt_page():
             <span style="color:var(--orange); margin-left:8px;">※ OCRが使えないため、手動入力してください</span>
             {% endif %}
         </div>
+
+        <!-- Vision API 使用量バー -->
+        {% if ocr_result.vision_usage %}
+        {% set vu = ocr_result.vision_usage %}
+        <div style="margin-bottom:12px; padding:8px 12px; background:#f8f9fa; border-radius:6px; font-size:0.8rem;">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                <span>📊 Vision API 使用量 ({{ vu.month }})</span>
+                <span {% if vu.warning %}style="color:var(--orange); font-weight:bold;"{% endif %}>
+                    {{ vu.count }}/{{ "{:,}".format(vu.limit) }}回
+                    （残り{{ vu.remaining }}回）
+                </span>
+            </div>
+            <div style="height:6px; background:#e0e0e0; border-radius:3px; overflow:hidden;">
+                <div style="height:100%; width:{{ vu.percentage }}%;
+                    background:{% if vu.percentage >= 90 %}var(--danger){% elif vu.percentage >= 80 %}var(--orange){% else %}var(--success){% endif %};
+                    border-radius:3px; transition:width 0.3s;"></div>
+            </div>
+            {% if vu.warning %}
+            <div style="color:var(--orange); margin-top:4px; font-weight:bold;">
+                ⚠️ {{ vu.message }}
+            </div>
+            {% endif %}
+        </div>
+        {% endif %}
 
         <!-- OCRエラーがある場合の警告 -->
         {% if ocr_result.ocr_error %}
