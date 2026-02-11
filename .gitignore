@@ -27,6 +27,7 @@ secrets/
 credentials/
 *.credentials
 *.token
+gsheets_config.json
 
 # ------------------------------------------
 # 個人データ（プライバシー保護）
