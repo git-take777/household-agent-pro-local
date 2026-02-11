@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+data/
+test_data*/
+*.xlsx
+.env
+.DS_Store
