@@ -30,6 +30,8 @@ numpy>=1.24.0
 flask>=3.0.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
+gspread>=6.0.0
+google-auth>=2.0.0
 ```
 
 ### 2. Tesseract OCR のインストール（任意）
@@ -215,27 +217,96 @@ python3 kakeibo_pro.py import-csv rakuten ~/Downloads/rakuten.csv
 
 ---
 
+## Google スプレッドシート連携
+
+支出・収入を登録すると、自動で Google スプレッドシートの該当月シートにも反映されます。
+
+### 初回セットアップ
+
+```bash
+python3 setup_sheets.py
+```
+
+対話式でガイドされます。サービスアカウントの作成と、スプレッドシートの共有設定を 1 回行うだけで、以降はすべて自動です。
+
+### 仕組み
+
+登録ボタンを押すと、3 つの保存先に同時書き込みされます:
+
+```
+レシート登録 / 支出追加 / 収入追加
+  ├→ data/expenses.json（ローカル JSON）
+  ├→ 26年家計簿.xlsx（ローカル Excel）
+  └→ Google Sheets（クラウド）
+```
+
+- **ローカル Excel**（`excel_sync.py`）: インターネット不要で常に動作。月別シート + 年間サマリーの数式集計付き。
+- **Google Sheets**（`google_sheets_sync.py`）: サービスアカウント方式で認証。API レート制限対策（バッチ書き込み + 待機制御）済み。
+
+### セットアップに必要なもの
+
+1. Google Cloud Console で「サービスアカウント」を作成
+2. Google Sheets API と Google Drive API を有効化
+3. JSON キーをダウンロード → `credentials/service_account.json` に配置
+4. 自分の Google アカウントで空のスプレッドシートを作成し、サービスアカウントのメールアドレスを「編集者」として共有
+
+詳しくは `setup_sheets.py` を実行すると画面上にガイドが表示されます。
+
+---
+
+## 開発アプローチ
+
+### スキル定義による品質管理
+
+プロジェクトのルートに `.claude/` ディレクトリを設け、開発の指針となるドキュメントを管理しています。
+
+- **`.claude/Skills.md`** — 技術スタック、モジュール構成、各モジュールの責務分界点、コーディング規約、テスト方針、セキュリティポリシーを定義したスキルシートです。新しい機能を追加する際は、このファイルを参照して既存の設計方針と一貫性を保ちます。たとえば、カテゴリの追加は `config.py` に集約する、データの読み書きは `data_manager.py` を経由する、といった原則がここに記載されています。
+- **`.claude/update_log.md`** — バージョンごとの変更履歴をセマンティックに記録しています。何を変えたかだけでなく、なぜ変えたか（例: macOS AirPlay によるポート競合の回避、Jinja2 の dict.items() 衝突回避など）も含め、同じ問題を繰り返さないための知見ベースとして機能します。
+
+この 2 つのファイルは `.gitignore` で Git 管理から除外されており、公開リポジトリには含まれません。プロジェクト固有の開発ナレッジをコードベースとは独立して蓄積し、開発者の交代やブランク期間があっても設計意図を失わない仕組みです。
+
+### 反復改善サイクル
+
+本プロジェクトは以下のサイクルで開発を進めています:
+
+1. **スキル定義の参照** — Skills.md で設計方針・モジュール責務を確認
+2. **実装** — 方針に沿ってコードを追加・修正
+3. **自己レビュー** — テストスイート（25 ケース）による自動検証 + 全ルートの HTTP レスポンス確認
+4. **障害対応のフィードバック** — 発生したエラーと解決策を update_log.md に記録し、再発防止策をコードに反映（例: Tesseract 未インストール時のフォールバック、API レート制限対策）
+5. **目的別コミット** — gitmoji 形式で変更の種類（feat / fix / refactor / docs / security）を明示し、履歴から変更意図を追跡可能にする
+
+この「定義 → 実装 → 検証 → 記録」のループにより、機能追加のたびに品質と保守性が向上していく構造になっています。
+
+---
+
 ## プロジェクト構成
 
 ```
 HouseholdFinanceProAgent/
-├── web_app.py           # Flask Webアプリケーション（メイン）
-├── kakeibo_pro.py       # CLIインターフェース
-├── config.py            # カテゴリ・予算・スコア定義
-├── data_manager.py      # CRUD操作 + JSONデータ永続化
-├── analyzer.py          # 統計分析エンジン
-├── excel_reporter.py    # Excelレポート生成
-├── receipt_scanner.py   # レシートOCRスキャナー
-├── pay_integration.py   # Pay決済CSV取込
-├── test_kakeibo.py      # テストスイート（25テスト）
-├── requirements.txt     # 依存パッケージ
-├── start_server.sh      # サーバー起動スクリプト
-├── setup_and_push.sh    # Git push用スクリプト
-├── data/                # JSONデータ保存先（自動生成）
+├── web_app.py              # Flask Webアプリケーション（メイン）
+├── kakeibo_pro.py          # CLIインターフェース
+├── config.py               # カテゴリ・予算・スコア定義
+├── data_manager.py         # CRUD操作 + JSON永続化 + Excel/Sheets同期フック
+├── analyzer.py             # 統計分析エンジン
+├── excel_reporter.py       # Excelレポート生成（7シート）
+├── excel_sync.py           # ローカルExcel自動同期エンジン
+├── google_sheets_sync.py   # Google Sheets自動同期エンジン
+├── receipt_scanner.py      # レシートOCRスキャナー
+├── pay_integration.py      # Pay決済CSV取込
+├── setup_sheets.py         # Google Sheets連携セットアップ（対話式）
+├── test_kakeibo.py         # テストスイート（25テスト）
+├── requirements.txt        # 依存パッケージ
+├── start_server.sh         # サーバー起動スクリプト
+├── .claude/                # 開発ナレッジ（Git管理外）
+│   ├── Skills.md           #   スキル定義・設計方針
+│   └── update_log.md       #   変更履歴・障害対応記録
+├── credentials/            # APIキー（Git管理外）
+│   └── service_account.json
+├── data/                   # JSONデータ保存先（自動生成）
 │   ├── expenses.json
 │   ├── incomes.json
 │   └── budgets.json
-└── uploads/             # レシート画像保存先（自動生成）
+└── uploads/                # レシート画像保存先（自動生成）
 ```
 
 ---
