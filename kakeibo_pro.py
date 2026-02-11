@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import get_all_expense_categories, INCOME_CATEGORIES, CATEGORIES, DEFAULT_BUDGETS
 from data_manager import (
     add_expense, add_income, get_expenses, get_incomes,
-    delete_expense, set_budgets, get_budgets, generate_sample_data,
+    delete_expense, set_budgets, get_budgets,
 )
 from analyzer import monthly_summary, budget_vs_actual, cost_effectiveness_analysis
 from excel_reporter import generate_full_report
@@ -36,24 +36,14 @@ OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def cmd_demo():
     print("=" * 50)
-    print("  家計Pro - デモモード")
+    print("  家計Pro - レポート生成")
     print("=" * 50)
-    print("\nサンプルデータを6ヶ月分生成します...")
-    generate_sample_data(6)
 
     today = date.today()
     output_path = os.path.join(OUTPUT_DIR, f"家計Pro_レポート_{today.strftime('%Y%m')}.xlsx")
-    print(f"\nレポートを生成中...")
+    print(f"\n{today.year}年{today.month}月のレポートを生成中...")
     generate_full_report(today.year, today.month, output_path)
     print(f"レポート作成完了: {output_path}")
-    print("\nExcelファイルを開いて各シートを確認してください:")
-    print("  - ダッシュボード: 月次概要・カテゴリ別支出・円グラフ")
-    print("  - 支出明細: 全支出の詳細リスト")
-    print("  - 収入明細: 全収入の詳細リスト")
-    print("  - 予算vs実績: 予算と実績の比較・棒グラフ")
-    print("  - 月次トレンド: 6ヶ月間の推移・折れ線グラフ")
-    print("  - 費用対効果: 無駄な支出の検出・改善提案")
-    print("  - 異常値検出: 統計的に異常な支出の検出")
 
 
 def cmd_add():

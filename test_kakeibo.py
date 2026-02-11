@@ -21,7 +21,7 @@ import data_manager
 from data_manager import (
     add_expense, add_income, get_expenses, get_incomes,
     delete_expense, delete_income, update_expense,
-    set_budgets, get_budgets, generate_sample_data,
+    set_budgets, get_budgets,
     _validate_date,
 )
 from analyzer import (

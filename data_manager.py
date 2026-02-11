@@ -195,71 +195,14 @@ def get_budgets(year: int, month: int) -> Dict[str, int]:
     return DEFAULT_BUDGETS.copy()
 
 
-# === サンプルデータ生成 ===
 
-def generate_sample_data(months: int = 6):
-    """デモ用のサンプルデータを生成する"""
-    import random
-    random.seed(42)
+# === データ初期化 ===
 
-    today = date.today()
-    base_year = today.year
-    base_month = today.month
-
+def reset_all_data():
+    """全データを初期化する（支出・収入を空にする）"""
     _ensure_data_dir()
     _save_json(EXPENSE_FILE, [])
     _save_json(INCOME_FILE, [])
-
-    expense_ranges = {
-        "住居費": (75000, 85000), "光熱費": (8000, 25000),
-        "通信費": (8000, 12000), "保険料": (18000, 22000),
-        "食費": (35000, 65000), "日用品": (3000, 12000),
-        "交通費": (5000, 15000), "衣服費": (0, 20000),
-        "医療費": (0, 10000), "娯楽費": (5000, 25000),
-        "交際費": (3000, 20000), "美容費": (0, 8000),
-        "サブスク": (3000, 6000), "教育費": (0, 10000),
-    }
-
-    income_ranges = {
-        "給与": (280000, 320000),
-        "副業": (0, 50000),
-    }
-
-    for i in range(months):
-        m = base_month - months + i + 1
-        y = base_year
-        while m <= 0:
-            m += 12
-            y -= 1
-        while m > 12:
-            m -= 12
-            y += 1
-
-        for cat, (lo, hi) in expense_ranges.items():
-            amt = random.randint(lo, hi)
-            if amt == 0:
-                continue
-            num_entries = random.randint(1, 4) if cat in ("食費", "日用品", "交通費") else 1
-            per_entry = amt // num_entries
-            for j in range(num_entries):
-                day = random.randint(1, 28)
-                memos = {
-                    "食費": ["スーパー", "外食", "コンビニ", "デリバリー"],
-                    "日用品": ["ドラッグストア", "100均", "ホームセンター"],
-                    "交通費": ["定期代", "タクシー", "ガソリン"],
-                    "娯楽費": ["映画", "ゲーム", "旅行", "書籍"],
-                    "交際費": ["飲み会", "ランチ", "プレゼント"],
-                }
-                memo = random.choice(memos.get(cat, [""]))
-                add_expense(f"{y}-{m:02d}-{day:02d}", cat, per_entry, memo)
-
-        for cat, (lo, hi) in income_ranges.items():
-            amt = random.randint(lo, hi)
-            if amt == 0:
-                continue
-            add_income(f"{y}-{m:02d}-25", cat, amt, f"{m}月分{cat}")
-
-    print(f"サンプルデータを{months}ヶ月分生成しました。")
 
 
 def _next_id(filepath: str) -> int:
