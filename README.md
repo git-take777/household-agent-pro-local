@@ -32,11 +32,41 @@ Pillow>=10.0.0
 pytesseract>=0.3.10
 gspread>=6.0.0
 google-auth>=2.0.0
+google-cloud-vision>=3.5.0
 ```
 
-### 2. Tesseract OCR のインストール（任意）
+### 2. Google Cloud Vision API のセットアップ（推奨）
 
-レシート画像から自動で店舗名・金額・日付を読み取る機能を使う場合に必要です。インストールしなくても他の全機能は動作します。
+レシート OCR の精度を大幅に向上させます。**月 1,000 回まで無料**（一般家庭の利用には十分です）。
+
+**手順:**
+
+1. [Google Cloud Console](https://console.cloud.google.com/) で **Vision API** を有効化
+   - API とサービス → ライブラリ → 「Cloud Vision API」を検索 → 有効にする
+2. サービスアカウントキー（JSON）を `credentials/` フォルダに配置
+   - Google Sheets 連携で既に作成済みの場合はそのまま使えます
+3. パッケージをインストール:
+
+```bash
+pip3 install google-cloud-vision
+```
+
+4. セットアップの確認:
+
+```bash
+python3 vision_ocr.py
+```
+
+全項目に ✅ が出れば準備完了です。
+
+**使用量管理:**
+- `data/vision_usage.json` に月間使用量が自動記録されます
+- 無料枠の 80% に到達すると ⚠️ 警告が表示されます
+- 100% に到達すると自動で Tesseract にフォールバックし、課金は発生しません
+
+### 3. Tesseract OCR のインストール（Vision API のフォールバック）
+
+Vision API が未設定の場合や無料枠を使い切った場合のフォールバックとして動作します。Vision API を設定済みの場合も、バックアップとしてインストールしておくことを推奨します。
 
 **macOS（Homebrew）:**
 
@@ -51,7 +81,7 @@ brew install tesseract-lang   # 日本語 OCR を有効にする
 sudo apt install tesseract-ocr tesseract-ocr-jpn
 ```
 
-### 3. サーバーの起動
+### 4. サーバーの起動
 
 ```bash
 cd /path/to/HouseholdFinanceProAgent
@@ -134,15 +164,16 @@ chmod +x start_server.sh
 2. 対応形式: **JPEG (.jpg, .jpeg)** と **PNG (.png)**
 3. アップロードすると自動で以下が行われます:
    - **画像圧縮**: 長辺 1600px 以下にリサイズ、JPEG は目標 500KB 以下に品質調整、EXIF 回転自動補正
-   - **OCR 解析**: Tesseract で画像からテキストを抽出し、以下を自動推定:
-     - **店舗名**: セブンイレブン、ローソン、イオン、マクドナルドなど 50 以上の店舗に対応
-     - **日付**: `YYYY/MM/DD`、`YYYY-MM-DD`、`R8/02/11`（令和）形式に対応
-     - **合計金額**: 「合計」「小計」「税込」キーワード付近の金額を検出
-     - **カテゴリ**: 店舗名やキーワードから自動推定（食費、日用品、交通費など）
-     - **決済方法**: 現金、クレジット、PayPay、Suica などを検出
+   - **OCR 解析**: Google Cloud Vision API（優先）または Tesseract で画像からテキストを抽出し、以下を自動推定:
+     - **店舗名**: 100 以上の日本の店舗名を直接マッチング（スーパー、飲食店、ドラッグストア、家電量販店 etc.）
+     - **日付**: `2026年2月8日`、`YYYY/MM/DD`、`R8/02/11`（令和）形式に対応
+     - **合計金額**: 「合計」行の ¥ 付き金額を最優先で検出、全角数字も自動変換
+     - **カテゴリ**: 店舗名やキーワードから自動推定（食費、外食費、日用品、交通費など）
+     - **決済方法**: コード決済、楽天ペイ、PayPay、電子マネー、現金など日本の主要決済を検出
+   - **Vision API 使用量**: ページ上部にプログレスバーで今月の使用量を表示
 4. 読み取り結果を確認・修正して「この内容で支出登録する」をクリック
 
-**Tesseract 未インストールの場合**: 画像の圧縮・保存は行われ、手動入力フォームが表示されます。エラーメッセージで Tesseract のインストール方法も案内されます。
+**OCR エンジンの優先順位**: Vision API → Tesseract → 簡易モード（手入力）。Vision API が未設定でも、Tesseract があれば動作します。どちらもない場合は手入力フォームが表示されます。
 
 ### 予算管理
 
@@ -291,7 +322,8 @@ HouseholdFinanceProAgent/
 ├── excel_reporter.py       # Excelレポート生成（7シート）
 ├── excel_sync.py           # ローカルExcel自動同期エンジン
 ├── google_sheets_sync.py   # Google Sheets自動同期エンジン
-├── receipt_scanner.py      # レシートOCRスキャナー
+├── receipt_scanner.py      # レシートOCRスキャナー（CLI用）
+├── vision_ocr.py           # Google Cloud Vision API OCRモジュール
 ├── pay_integration.py      # Pay決済CSV取込
 ├── setup_sheets.py         # Google Sheets連携セットアップ（対話式）
 ├── test_kakeibo.py         # テストスイート（25テスト）
@@ -305,7 +337,8 @@ HouseholdFinanceProAgent/
 ├── data/                   # JSONデータ保存先（自動生成）
 │   ├── expenses.json
 │   ├── incomes.json
-│   └── budgets.json
+│   ├── budgets.json
+│   └── vision_usage.json   # Vision API月間使用量（自動管理）
 └── uploads/                # レシート画像保存先（自動生成）
 ```
 
@@ -332,14 +365,25 @@ python3 -m pytest test_kakeibo.py -v
 
 macOS Monterey 以降、ポート 5000 は AirPlay Receiver が占有しています。本アプリはポート **8080** を使用するため、`http://localhost:8080` にアクセスしてください。
 
+### レシート OCR の精度が悪い
+
+Google Cloud Vision API が設定されていない可能性があります。`python3 vision_ocr.py` を実行してセットアップ状態を確認してください。Vision API を使えば日本語レシートの読み取り精度が大幅に向上します。
+
 ### レシート画像をアップロードしても何も変わらない
 
-Tesseract OCR がインストールされていない可能性があります。ページに表示されるエラーメッセージを確認し、以下でインストールしてください:
+OCR エンジン（Vision API / Tesseract）がどちらも利用できない可能性があります。ページに表示されるエラーメッセージを確認してください。
+
+- Vision API のセットアップ: `python3 vision_ocr.py`
+- Tesseract のインストール:
 
 ```bash
 brew install tesseract
 brew install tesseract-lang
 ```
+
+### Vision API の無料枠を使い切った
+
+月間 1,000 回の無料枠に達すると、自動で Tesseract にフォールバックします。課金は発生しません。翌月1日に自動リセットされます。使用量はレシート読取ページのプログレスバーで確認できます。
 
 ### `ModuleNotFoundError: No module named 'flask'`
 
