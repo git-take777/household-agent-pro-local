@@ -9,7 +9,17 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-KAKEIBO_FILE = os.path.join(BASE_DIR, "26年家計簿.xlsx")
+# 年別ファイル対応: レシートの日付の年に応じて自動振り分け
+KAKEIBO_FILE = os.path.join(BASE_DIR, "26年家計簿.xlsx")  # デフォルト（後方互換）
+
+
+def _get_kakeibo_file(year: int = None):
+    """年に対応する家計簿ファイルパスを返す"""
+    if year is None:
+        year = datetime.now().year
+    # 西暦の下2桁 + "年家計簿.xlsx"
+    short_year = year % 100
+    return os.path.join(BASE_DIR, f"{short_year}年家計簿.xlsx")
 
 # === スタイル定義 ===
 HEADER_FONT = Font(name="Arial", bold=True, size=11, color="FFFFFF")
@@ -45,29 +55,33 @@ COLUMNS = {
 }
 
 
-def create_kakeibo_file(owner_name='Take "TH" Naito'):
-    """26年家計簿.xlsx を新規作成（月別シート + 年間サマリー）"""
+def create_kakeibo_file(owner_name='Take "TH" Naito', year: int = None):
+    """家計簿.xlsx を新規作成（月別シート + 年間サマリー）"""
+    if year is None:
+        year = datetime.now().year
+    filepath = _get_kakeibo_file(year)
+
     wb = Workbook()
 
     # --- 年間サマリーシート ---
     ws_summary = wb.active
     ws_summary.title = SUMMARY_SHEET
-    _build_summary_sheet(ws_summary, owner_name)
+    _build_summary_sheet(ws_summary, owner_name, year)
 
     # --- 月別シート（1月〜12月） ---
     for month_name in MONTH_NAMES:
         ws = wb.create_sheet(title=month_name)
-        _build_month_sheet(ws, month_name, owner_name)
+        _build_month_sheet(ws, month_name, owner_name, year)
 
-    wb.save(KAKEIBO_FILE)
-    return KAKEIBO_FILE
+    wb.save(filepath)
+    return filepath
 
 
-def _build_summary_sheet(ws, owner_name):
+def _build_summary_sheet(ws, owner_name, year: int = 2026):
     """年間サマリーシートを構築"""
     # タイトル
     ws.merge_cells("A1:G1")
-    ws["A1"] = f"2026年 家計簿 - {owner_name}"
+    ws["A1"] = f"{year}年 家計簿 - {owner_name}"
     ws["A1"].font = Font(name="Arial", bold=True, size=16, color="2C5F8A")
     ws["A1"].alignment = CENTER
 
@@ -93,14 +107,14 @@ def _build_summary_sheet(ws, owner_name):
         ws.cell(row=row, column=1).fill = SUBHEADER_FILL
 
         # 収入合計: SUMIF(種別="収入") on each month sheet
-        ws.cell(row=row, column=2).value = f"=SUMPRODUCT(('{month_name}'!B:B=\"収入\")*('{month_name}'!E:E))"
+        ws.cell(row=row, column=2).value = f"=SUMPRODUCT(('{month_name}'!B3:B1000=\"収入\")*('{month_name}'!E3:E1000))"
         ws.cell(row=row, column=2).number_format = YEN_FORMAT
         ws.cell(row=row, column=2).alignment = RIGHT
         ws.cell(row=row, column=2).border = BORDER_THIN
         ws.cell(row=row, column=2).fill = INCOME_FILL
 
         # 支出合計
-        ws.cell(row=row, column=3).value = f"=SUMPRODUCT(('{month_name}'!B:B=\"支出\")*('{month_name}'!E:E))"
+        ws.cell(row=row, column=3).value = f"=SUMPRODUCT(('{month_name}'!B3:B1000=\"支出\")*('{month_name}'!E3:E1000))"
         ws.cell(row=row, column=3).number_format = YEN_FORMAT
         ws.cell(row=row, column=3).alignment = RIGHT
         ws.cell(row=row, column=3).border = BORDER_THIN
@@ -115,12 +129,12 @@ def _build_summary_sheet(ws, owner_name):
         ws.cell(row=row, column=4).border = BORDER_THIN
 
         # 件数（収入）
-        ws.cell(row=row, column=5).value = f'=COUNTIF(\'{month_name}\'!B:B,"収入")'
+        ws.cell(row=row, column=5).value = f'=COUNTIF(\'{month_name}\'!B3:B1000,"収入")'
         ws.cell(row=row, column=5).alignment = CENTER
         ws.cell(row=row, column=5).border = BORDER_THIN
 
         # 件数（支出）
-        ws.cell(row=row, column=6).value = f'=COUNTIF(\'{month_name}\'!B:B,"支出")'
+        ws.cell(row=row, column=6).value = f'=COUNTIF(\'{month_name}\'!B3:B1000,"支出")'
         ws.cell(row=row, column=6).alignment = CENTER
         ws.cell(row=row, column=6).border = BORDER_THIN
 
@@ -155,11 +169,11 @@ def _build_summary_sheet(ws, owner_name):
         ws.column_dimensions[get_column_letter(i)].width = w
 
 
-def _build_month_sheet(ws, month_name, owner_name):
+def _build_month_sheet(ws, month_name, owner_name, year: int = 2026):
     """月別シートのヘッダーを構築"""
     # タイトル行
     ws.merge_cells("A1:G1")
-    ws["A1"] = f"2026年 {month_name} - {owner_name}"
+    ws["A1"] = f"{year}年 {month_name} - {owner_name}"
     ws["A1"].font = Font(name="Arial", bold=True, size=13, color="2C5F8A")
     ws["A1"].alignment = CENTER
 
@@ -188,28 +202,32 @@ def sync_income_to_excel(entry: dict):
 
 
 def _sync_entry_to_excel(entry: dict, entry_type: str):
-    """エントリを該当月のシートに追記する"""
-    if not os.path.exists(KAKEIBO_FILE):
-        create_kakeibo_file()
-
-    try:
-        wb = load_workbook(KAKEIBO_FILE)
-    except Exception:
-        create_kakeibo_file()
-        wb = load_workbook(KAKEIBO_FILE)
-
-    # 日付から月を特定
+    """エントリを該当年・該当月のシートに追記する"""
+    # 日付から年・月を特定
     date_str = entry.get("date", "")
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
+        year = dt.year
         month_idx = dt.month
     except ValueError:
+        year = datetime.now().year
         month_idx = datetime.now().month
+
+    # 年に対応するファイルを取得
+    filepath = _get_kakeibo_file(year)
+    if not os.path.exists(filepath):
+        create_kakeibo_file(year=year)
+
+    try:
+        wb = load_workbook(filepath)
+    except Exception:
+        create_kakeibo_file(year=year)
+        wb = load_workbook(filepath)
 
     sheet_name = f"{month_idx}月"
     if sheet_name not in wb.sheetnames:
         ws = wb.create_sheet(title=sheet_name)
-        _build_month_sheet(ws, sheet_name, "Ken")
+        _build_month_sheet(ws, sheet_name, 'Take "TH" Naito', year)
     else:
         ws = wb[sheet_name]
 
@@ -259,18 +277,40 @@ def _sync_entry_to_excel(entry: dict, entry_type: str):
     ws.cell(row=next_row, column=7).border = BORDER_THIN
     ws.cell(row=next_row, column=7).font = Font(name="Arial", size=9, color="999999")
 
-    wb.save(KAKEIBO_FILE)
+    wb.save(filepath)
 
 
 def rebuild_excel_from_json():
-    """既存のJSONデータからExcelを再構築する（リカバリ用）"""
+    """既存のJSONデータからExcelを年別に再構築する（リカバリ用）"""
     import json
 
     expense_file = os.path.join(BASE_DIR, "data", "expenses.json")
     income_file = os.path.join(BASE_DIR, "data", "incomes.json")
 
-    # 新規作成
-    create_kakeibo_file()
+    # 対象年を集めて各年のファイルを新規作成
+    all_entries = []
+    if os.path.exists(expense_file):
+        with open(expense_file, "r", encoding="utf-8") as f:
+            expenses = json.load(f)
+        all_entries.extend(expenses)
+    if os.path.exists(income_file):
+        with open(income_file, "r", encoding="utf-8") as f:
+            incomes = json.load(f)
+        all_entries.extend(incomes)
+
+    years = set()
+    for entry in all_entries:
+        try:
+            y = int(entry.get("date", "")[:4])
+            years.add(y)
+        except (ValueError, TypeError):
+            years.add(datetime.now().year)
+
+    if not years:
+        years = {datetime.now().year}
+
+    for year in years:
+        create_kakeibo_file(year=year)
 
     # 支出を復元
     if os.path.exists(expense_file):
@@ -286,9 +326,11 @@ def rebuild_excel_from_json():
         for entry in incomes:
             sync_income_to_excel(entry)
 
-    return KAKEIBO_FILE
+    created_files = [_get_kakeibo_file(y) for y in sorted(years)]
+    return created_files
 
 
 if __name__ == "__main__":
-    path = create_kakeibo_file()
+    year = datetime.now().year
+    path = create_kakeibo_file(year=year)
     print(f"作成完了: {path}")

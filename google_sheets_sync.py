@@ -28,7 +28,6 @@ SERVICE_ACCOUNT_FILE = os.path.join(CREDENTIALS_DIR, "service_account.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "gsheets_config.json")
 
 OWNER_NAME = 'Take "TH" Naito'
-SPREADSHEET_TITLE = f"2026年 家計簿 - {OWNER_NAME}"
 MONTH_NAMES = [f"{m}月" for m in range(1, 13)]
 SUMMARY_SHEET = "年間サマリー"
 
@@ -38,6 +37,34 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+
+def _get_spreadsheet_id_for_year(year: int) -> Optional[str]:
+    """指定年のスプレッドシートIDを取得"""
+    config = _load_config()
+    year_key = f"spreadsheet_{year}"
+    if year_key in config:
+        return config[year_key].get("spreadsheet_id")
+    # 旧形式（単一設定）との互換: 2026年はデフォルトのIDを使う
+    if year == 2026 and "spreadsheet_id" in config:
+        return config["spreadsheet_id"]
+    return None
+
+
+def _save_spreadsheet_for_year(year: int, spreadsheet_id: str, spreadsheet_url: str):
+    """指定年のスプレッドシートIDを保存"""
+    config = _load_config()
+    year_key = f"spreadsheet_{year}"
+    config[year_key] = {
+        "spreadsheet_id": spreadsheet_id,
+        "spreadsheet_url": spreadsheet_url,
+        "created_at": datetime.now().isoformat(),
+    }
+    # 旧形式との互換を維持
+    if year == 2026 and "spreadsheet_id" not in config:
+        config["spreadsheet_id"] = spreadsheet_id
+        config["spreadsheet_url"] = spreadsheet_url
+    _save_config(config)
 
 
 def _load_config() -> dict:
@@ -84,7 +111,7 @@ def get_service_account_email() -> Optional[str]:
 # ★ 新しいセットアップ方式: ユーザーが作成済みのシートを使う
 # ============================================================
 
-def setup_with_existing_sheet(spreadsheet_url: str):
+def setup_with_existing_sheet(spreadsheet_url: str, year: int = None):
     """
     ユーザーが自分のGoogleアカウントで作成したスプレッドシートを連携する。
 
@@ -94,8 +121,11 @@ def setup_with_existing_sheet(spreadsheet_url: str):
       3. この関数にURLを渡す
 
     例:
-      setup_with_existing_sheet("https://docs.google.com/spreadsheets/d/xxxxx/edit")
+      setup_with_existing_sheet("https://docs.google.com/spreadsheets/d/xxxxx/edit", year=2024)
     """
+    if year is None:
+        year = datetime.now().year
+
     client = _get_client()
     if not client:
         return
@@ -120,19 +150,15 @@ def setup_with_existing_sheet(spreadsheet_url: str):
         print(f"[Google Sheets] 接続エラー: {e}")
         return
 
-    # 設定を保存
-    config = _load_config()
-    config["spreadsheet_id"] = spreadsheet_id
-    config["spreadsheet_url"] = spreadsheet_url
-    config["created_at"] = datetime.now().isoformat()
-    _save_config(config)
+    # 年別設定を保存
+    _save_spreadsheet_for_year(year, spreadsheet_id, spreadsheet_url)
 
     # シート構造を初期化
-    _initialize_spreadsheet(spreadsheet)
+    _initialize_spreadsheet(spreadsheet, year)
 
-    print(f"[Google Sheets] セットアップ完了！")
+    print(f"[Google Sheets] {year}年 セットアップ完了！")
     print(f"  URL: {spreadsheet_url}")
-    print(f"  以降、支出・収入を登録するたびに自動で反映されます。")
+    print(f"  以降、{year}年の支出・収入を登録するたびに自動で反映されます。")
 
 
 def _extract_sheet_id(url: str) -> Optional[str]:
@@ -152,23 +178,23 @@ def _extract_sheet_id(url: str) -> Optional[str]:
 # スプレッドシート取得（登録時に毎回呼ばれる）
 # ============================================================
 
-def get_spreadsheet() -> Optional["gspread.Spreadsheet"]:
-    """設定済みのスプレッドシートを取得"""
+def get_spreadsheet(year: int = None) -> Optional["gspread.Spreadsheet"]:
+    """指定年のスプレッドシートを取得"""
+    if year is None:
+        year = datetime.now().year
+
     client = _get_client()
     if not client:
         return None
 
-    config = _load_config()
-    spreadsheet_id = config.get("spreadsheet_id")
-
+    spreadsheet_id = _get_spreadsheet_id_for_year(year)
     if not spreadsheet_id:
-        # 未セットアップ → サイレントにスキップ
         return None
 
     try:
         return client.open_by_key(spreadsheet_id)
     except Exception as e:
-        print(f"[Google Sheets] スプレッドシート取得エラー: {e}")
+        print(f"[Google Sheets] {year}年 スプレッドシート取得エラー: {e}")
         return None
 
 
@@ -176,7 +202,7 @@ def get_spreadsheet() -> Optional["gspread.Spreadsheet"]:
 # シート初期化
 # ============================================================
 
-def _initialize_spreadsheet(spreadsheet: "gspread.Spreadsheet"):
+def _initialize_spreadsheet(spreadsheet: "gspread.Spreadsheet", year: int = 2026):
     """スプレッドシートに月別シート + 年間サマリーを作成（API制限対策あり）"""
     existing_sheets = [ws.title for ws in spreadsheet.worksheets()]
 
@@ -184,7 +210,7 @@ def _initialize_spreadsheet(spreadsheet: "gspread.Spreadsheet"):
     for month_name in MONTH_NAMES:
         if month_name not in existing_sheets:
             ws = spreadsheet.add_worksheet(title=month_name, rows=1000, cols=10)
-            _setup_month_sheet(ws, month_name)
+            _setup_month_sheet(ws, month_name, year)
             print(f"  シート作成: {month_name}")
             time.sleep(5)  # API制限回避: 5秒待機
         else:
@@ -196,11 +222,11 @@ def _initialize_spreadsheet(spreadsheet: "gspread.Spreadsheet"):
         if default_sheets:
             default_sheets[0].update_title(SUMMARY_SHEET)
             time.sleep(3)
-            _setup_summary_sheet(default_sheets[0])
+            _setup_summary_sheet(default_sheets[0], year)
         else:
             ws = spreadsheet.add_worksheet(title=SUMMARY_SHEET, rows=50, cols=10)
             time.sleep(3)
-            _setup_summary_sheet(ws)
+            _setup_summary_sheet(ws, year)
         print(f"  シート作成: {SUMMARY_SHEET}")
     else:
         print(f"  シート既存: {SUMMARY_SHEET}")
@@ -218,10 +244,10 @@ def _initialize_spreadsheet(spreadsheet: "gspread.Spreadsheet"):
     print("[Google Sheets] 全13シート初期化完了")
 
 
-def _setup_month_sheet(ws: "gspread.Worksheet", month_name: str):
+def _setup_month_sheet(ws: "gspread.Worksheet", month_name: str, year: int = 2026):
     # データとヘッダーを1回で書き込み
     ws.update(range_name="A1:G2", values=[
-        [f"2026年 {month_name} - {OWNER_NAME}", "", "", "", "", "", ""],
+        [f"{year}年 {month_name} - {OWNER_NAME}", "", "", "", "", "", ""],
         HEADERS,
     ])
     time.sleep(2)
@@ -243,10 +269,10 @@ def _setup_month_sheet(ws: "gspread.Worksheet", month_name: str):
         pass
 
 
-def _setup_summary_sheet(ws: "gspread.Worksheet"):
+def _setup_summary_sheet(ws: "gspread.Worksheet", year: int = 2026):
     # タイトル + ヘッダーをまとめて1回で書き込み
     title_and_header = [
-        [f"2026年 家計簿 - {OWNER_NAME}", "", "", "", "", "", ""],
+        [f"{year}年 家計簿 - {OWNER_NAME}", "", "", "", "", "", ""],
         ["年間サマリー（自動集計）", "", "", "", "", "", ""],
         ["", "", "", "", "", "", ""],  # 空行
         ["月", "収入合計", "支出合計", "収支差額", "件数（収入）", "件数（支出）", "件数（合計）"],
@@ -309,16 +335,18 @@ def sync_income_to_sheets(entry: dict):
 
 
 def _sync_entry_to_sheets(entry: dict, entry_type: str):
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet:
-        return
-
     date_str = entry.get("date", "")
     try:
         dt = datetime.strptime(date_str, "%Y-%m-%d")
+        year = dt.year
         month_idx = dt.month
     except ValueError:
+        year = datetime.now().year
         month_idx = datetime.now().month
+
+    spreadsheet = get_spreadsheet(year)
+    if not spreadsheet:
+        return
 
     sheet_name = f"{month_idx}月"
 
@@ -326,7 +354,7 @@ def _sync_entry_to_sheets(entry: dict, entry_type: str):
         ws = spreadsheet.worksheet(sheet_name)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=10)
-        _setup_month_sheet(ws, sheet_name)
+        _setup_month_sheet(ws, sheet_name, year)
 
     all_values = ws.col_values(1)
     next_row = len(all_values) + 1
@@ -366,15 +394,42 @@ def _sync_entry_to_sheets(entry: dict, entry_type: str):
 # ============================================================
 
 def rebuild_sheets_from_json():
-    """既存のJSONデータからGoogle Sheetsを再構築する"""
+    """既存のJSONデータからGoogle Sheetsを年別に再構築する"""
     expense_file = os.path.join(BASE_DIR, "data", "expenses.json")
     income_file = os.path.join(BASE_DIR, "data", "incomes.json")
 
-    spreadsheet = get_spreadsheet()
-    if not spreadsheet:
-        print("スプレッドシートが未設定です。先に setup_with_existing_sheet() を実行してください。")
+    # 全エントリから対象年を収集
+    all_entries = []
+    if os.path.exists(expense_file):
+        with open(expense_file, "r", encoding="utf-8") as f:
+            all_entries.extend(json.load(f))
+    if os.path.exists(income_file):
+        with open(income_file, "r", encoding="utf-8") as f:
+            all_entries.extend(json.load(f))
+
+    years = set()
+    for entry in all_entries:
+        try:
+            years.add(int(entry.get("date", "")[:4]))
+        except (ValueError, TypeError):
+            years.add(datetime.now().year)
+
+    if not years:
+        years = {datetime.now().year}
+
+    # 各年のスプレッドシートが設定されているか確認
+    missing_years = []
+    for year in sorted(years):
+        sid = _get_spreadsheet_id_for_year(year)
+        if not sid:
+            missing_years.append(year)
+
+    if missing_years:
+        print(f"以下の年のスプレッドシートが未設定です: {missing_years}")
+        print("先に setup_with_existing_sheet(url, year=XXXX) を実行してください。")
         return
 
+    # 支出を復元
     if os.path.exists(expense_file):
         with open(expense_file, "r", encoding="utf-8") as f:
             expenses = json.load(f)
@@ -382,12 +437,15 @@ def rebuild_sheets_from_json():
             sync_expense_to_sheets(entry)
         print(f"支出 {len(expenses)} 件を復元しました")
 
+    # 収入を復元
     if os.path.exists(income_file):
         with open(income_file, "r", encoding="utf-8") as f:
             incomes = json.load(f)
         for entry in incomes:
             sync_income_to_sheets(entry)
         print(f"収入 {len(incomes)} 件を復元しました")
+
+    print(f"対象年: {sorted(years)}")
 
 
 def get_spreadsheet_url() -> Optional[str]:
@@ -438,8 +496,19 @@ if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
         url = sys.argv[1]
+        # 第2引数があれば年として扱う
+        year = None
+        if len(sys.argv) > 2:
+            try:
+                year = int(sys.argv[2])
+            except ValueError:
+                print(f"年の指定が不正です: {sys.argv[2]}")
+                sys.exit(1)
+        if year is None:
+            year = datetime.now().year
         print(f"スプレッドシートURL: {url}")
-        setup_with_existing_sheet(url)
+        print(f"対象年: {year}")
+        setup_with_existing_sheet(url, year=year)
     else:
         status = check_connection()
         print("=== Google Sheets 接続状態 ===")
@@ -451,3 +520,19 @@ if __name__ == "__main__":
             print(f"\n★ サービスアカウントのメールアドレス:")
             print(f"  {sa_email}")
             print(f"  → このアドレスをスプレッドシートの共有設定に「編集者」として追加してください")
+
+        # 設定済みの年別スプレッドシート一覧
+        config = _load_config()
+        print(f"\n★ 設定済みスプレッドシート:")
+        for key, val in config.items():
+            if key.startswith("spreadsheet_") and isinstance(val, dict):
+                year_str = key.replace("spreadsheet_", "")
+                url_val = val.get("spreadsheet_url", "未設定")
+                print(f"  {year_str}年: {url_val}")
+        # 旧形式（2026年デフォルト）
+        if "spreadsheet_id" in config and "spreadsheet_2026" not in config:
+            print(f"  2026年(デフォルト): {config.get('spreadsheet_url', '未設定')}")
+
+        print(f"\n★ 使い方:")
+        print(f"  python3 google_sheets_sync.py <URL> <年>")
+        print(f"  例: python3 google_sheets_sync.py https://docs.google.com/.../edit 2024")
