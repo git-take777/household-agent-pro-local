@@ -39,15 +39,43 @@ REPORT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # ============================================================
+#  HEIC/HEIF サポート登録 (iPhone標準フォーマット)
+#  pillow-heif が入っていれば Pillow で .heic を直接開ける。
+#  未導入でも他形式は通常通り動作するよう、失敗は黙って無視する。
+# ============================================================
+HEIC_SUPPORTED = False
+try:
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    HEIC_SUPPORTED = True
+except Exception:
+    HEIC_SUPPORTED = False
+
+HEIC_EXTS = (".heic", ".heif")
+
+
+# ============================================================
 #  Image Compression Utility
 # ============================================================
 def compress_image(image_bytes, filename, max_size_kb=500, max_dimension=1600):
     """
-    JPEG/PNG画像を圧縮して小さくする
+    アップロード画像を圧縮して小さくする。
+    - JPEG/PNG: そのままの形式を維持して圧縮
+    - HEIC/HEIF: JPEG へ変換（写真用途でサイズ最小かつ高画質、OCR互換）
     - max_size_kb: 目標最大ファイルサイズ(KB)
     - max_dimension: 最大辺のピクセル数
     """
     from PIL import Image
+
+    ext = os.path.splitext(filename)[1].lower()
+    is_heic = ext in HEIC_EXTS
+
+    if is_heic and not HEIC_SUPPORTED:
+        raise RuntimeError(
+            "HEIC画像を読み込むには pillow-heif が必要です。"
+            "`pip install pillow-heif` を実行するか、JPEG/PNGで再アップロードしてください。"
+        )
 
     img = Image.open(io.BytesIO(image_bytes))
     original_size = len(image_bytes)
@@ -76,8 +104,7 @@ def compress_image(image_bytes, filename, max_size_kb=500, max_dimension=1600):
         new_h = int(h * ratio)
         img = img.resize((new_w, new_h), Image.LANCZOS)
 
-    # 拡張子から形式判定
-    ext = os.path.splitext(filename)[1].lower()
+    # 形式判定: PNGはPNG維持、それ以外(JPEG/HEIC等)はJPEGへ
     is_png = ext == ".png"
 
     # 保存 & 圧縮
@@ -552,15 +579,26 @@ def parse_receipt_ocr(text):
                 result["store_name"] = name
                 break
 
-    # フォールバック: 最初の非数字行を店名とする
+    # フォールバック: レシート最上部から店名を推定
+    # レシートの構造: 店名 → 住所 → 電話番号 → 日付 → 品目...
+    # 最上部の「意味のある文字列」が店名である可能性が高い
     if not result["store_name"] and lines:
-        for line in lines[:5]:
-            # 電話番号、登録番号、日付のみの行はスキップ
-            if re.match(r"^[\d\s\-/:.TELtelFAXfax#＃T※]+$", line):
+        for line in lines[:7]:
+            # 明らかにスキップすべき行
+            if re.match(r"^[\d\s\-/:.TELtelFAXfax#＃T※〒]+$", line):
                 continue
-            if re.match(r"^(登録番号|レジ|TEL|FAX|電話)", line):
+            if re.match(r"^(登録番号|レジ|TEL|FAX|電話|〒|住所|領収)", line):
                 continue
-            if len(line) <= 2:
+            if len(line) <= 1:
+                continue
+            # 日付行はスキップ（2025/02/11 など）
+            if re.match(r"^\d{2,4}[/\-年]\d{1,2}[/\-月]\d{1,2}", line):
+                continue
+            # 住所行をスキップ（都道府県・市区町村で始まる行）
+            if re.match(r"^.{0,3}(都|道|府|県|市|区|町|村|郡)", line):
+                continue
+            # 長すぎる行は住所の可能性が高い（店名は通常短い）
+            if len(line) > 30:
                 continue
             result["store_name"] = line[:30]
             break
@@ -664,14 +702,15 @@ def parse_receipt_ocr(text):
     # 割引パターン
     discount_pattern = re.compile(r"[-ー−]\s*([0-9][0-9,]*)")
 
-    # 合計金額の検出（最優先）
+    # 合計金額の検出（改善版 v3）
     # 優先度:
     #   P1: 「税込合計」「合計(税込)」 + ¥金額
     #   P2: 「合計」(小計以外) + ¥金額
     #   P3: 「お支払」「請求額」 + ¥金額
-    #   P4: 「合計」 + 金額（¥なし）
+    #   P4: 「合計」 + 金額（¥なし）→ +10 penalty
     #   P5: 「小計」 + ¥金額
     #   ※ 同じ優先度なら後（下の行）に出たものを採用
+    #   ※ 「合計」行の直後に¥金額のみの行がある場合も対応
     total_found = False
     total_candidates = []
 
@@ -683,7 +722,12 @@ def parse_receipt_ocr(text):
         (5, ["小計", "小 計"]),
     ]
 
-    for line in lines:
+    # 「合計 ¥金額」を直接探すパターン（スペース・全角対応）
+    direct_total_pattern = re.compile(
+        r"(?:税込\s*)?合計\s*[¥￥\\]\s*([0-9][0-9,]*)"
+    )
+
+    for i, line in enumerate(lines):
         # スキップ対象行（ただし合計キーワードを含む行は除外しない）
         is_total_line = any(kw in line for kw in total_keywords)
         if any(kw in line for kw in skip_keywords) and not is_total_line:
@@ -702,6 +746,17 @@ def parse_receipt_ocr(text):
                 else:
                     line_priority = min(line_priority, pri)
                 break
+
+        # 直接パターン「合計 ¥金額」を最優先で探す
+        dm = direct_total_pattern.search(line)
+        if dm:
+            try:
+                val = int(dm.group(1).replace(",", ""))
+                if 10 <= val <= 999999:
+                    total_candidates.append((line_priority, "direct", val, line))
+                    continue
+            except ValueError:
+                pass
 
         # ¥付き金額を探す
         yen_matches = yen_pattern.findall(line)
@@ -725,13 +780,31 @@ def parse_receipt_ocr(text):
                 except ValueError:
                     pass
 
+            # 合計行に金額がない場合、次の行に¥金額がある可能性をチェック
+            if not nums and i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
+                next_yen = yen_pattern.findall(next_line)
+                if next_yen:
+                    for m in next_yen:
+                        try:
+                            val = int(m.replace(",", ""))
+                            if 10 <= val <= 999999:
+                                total_candidates.append((line_priority, "next_line", val, line + " " + next_line))
+                        except ValueError:
+                            pass
+
     # 合計候補から最適なものを選択
     # 最も優先度が高い（数字が小さい）ものを採用。同優先度なら最後のもの
     if total_candidates:
         best_priority = min(c[0] for c in total_candidates)
         best_candidates = [c for c in total_candidates if c[0] == best_priority]
-        # 同優先度の中で最後のものを採用（レシートは下に行くほど最終合計）
-        _, _, best_val, _ = best_candidates[-1]
+        # 同優先度の中で「direct」タイプを優先、なければ最後のものを採用
+        direct_matches = [c for c in best_candidates if c[1] == "direct"]
+        if direct_matches:
+            _, _, best_val, _ = direct_matches[-1]
+        else:
+            # レシートは下に行くほど最終合計なので最後のものを採用
+            _, _, best_val, _ = best_candidates[-1]
         result["total"] = best_val
         total_found = True
 
@@ -825,6 +898,19 @@ def parse_receipt_ocr(text):
         "大戸屋": "外食費", "やよい軒": "外食費",
         "新時代": "外食費", "鳥貴族": "外食費",
         "日高屋": "外食費", "一蘭": "外食費",
+        "丸亀製麺": "外食費", "はなまるうどん": "外食費",
+        "CoCo壱番屋": "外食費", "かつや": "外食費",
+        "天丼てんや": "外食費", "なか卯": "外食費",
+        "餃子の王将": "外食費", "幸楽苑": "外食費",
+        "リンガーハット": "外食費", "磯丸水産": "外食費",
+        "一風堂": "外食費", "天下一品": "外食費",
+        "バーミヤン": "外食費", "ジョナサン": "外食費",
+        "デニーズ": "外食費", "ココス": "外食費",
+        "ロイヤルホスト": "外食費",
+        "モスバーガー": "外食費", "バーガーキング": "外食費",
+        "串カツ田中": "外食費", "和民": "外食費",
+        "魚民": "外食費", "白木屋": "外食費",
+        "サンマルク": "外食費", "ベローチェ": "外食費",
         # ドラッグストア
         "マツモトキヨシ": "日用品", "ウエルシア": "日用品",
         "サンドラッグ": "日用品", "ツルハ": "日用品",
@@ -1659,64 +1745,92 @@ def add_income_page():
     )
 
 
+def _process_receipt_file(file):
+    """
+    1枚のレシート画像を 読み込み→圧縮→保存→OCR まで処理し、
+    結果を1件分の dict で返す。複数アップロードのループから呼ばれる。
+    """
+    import traceback
+
+    res = {
+        "filename": file.filename,
+        "ocr_result": None,
+        "compression_info": None,
+        "error": None,        # 詳細(トレース付き)
+        "error_short": None,  # flash用の短いメッセージ
+    }
+
+    # Step 1: 画像読み込み
+    try:
+        image_bytes = file.read()
+        if not image_bytes:
+            res["error_short"] = "ファイルが空です。"
+            res["error"] = res["error_short"]
+            return res
+    except Exception as e:
+        res["error_short"] = f"読み込みエラー: {e}"
+        res["error"] = f"画像読み込みエラー: {e}\n{traceback.format_exc()}"
+        return res
+
+    # Step 2: 画像圧縮 (HEICはJPEGへ変換)
+    try:
+        comp = compress_image(image_bytes, file.filename)
+        res["compression_info"] = comp
+    except Exception as e:
+        res["error_short"] = f"圧縮エラー: {e}"
+        res["error"] = f"画像圧縮エラー: {e}\n{traceback.format_exc()}"
+        return res
+
+    # Step 3: 保存
+    try:
+        ext = ".png" if comp["format"] == "PNG" else ".jpg"
+        save_name = f"receipt_{uuid.uuid4().hex[:8]}{ext}"
+        save_path = os.path.join(UPLOAD_DIR, save_name)
+        with open(save_path, "wb") as f:
+            f.write(comp["bytes"])
+    except Exception as e:
+        res["error_short"] = f"保存エラー: {e}"
+        res["error"] = f"ファイル保存エラー: {e}\n{traceback.format_exc()}"
+        return res
+
+    # Step 4: OCR実行
+    try:
+        ocr_result = ocr_receipt(comp["image"], save_path, image_bytes=comp["bytes"])
+        ocr_result["saved_path"] = save_path
+        ocr_result["saved_name"] = save_name
+        res["ocr_result"] = ocr_result
+    except Exception as e:
+        res["error_short"] = f"OCRエラー: {e}"
+        res["error"] = f"OCRエラー: {e}\n{traceback.format_exc()}"
+
+    return res
+
+
 @app.route("/receipt", methods=["GET", "POST"])
 def receipt_page():
-    ocr_result = None
-    compression_info = None
+    results = []
     error_detail = None
 
     if request.method == "POST":
         if "receipt_image" in request.files:
-            file = request.files["receipt_image"]
-            if file.filename:
-                import traceback
-
-                # Step 1: 画像読み込み
-                try:
-                    image_bytes = file.read()
-                    filename = file.filename
-                    if not image_bytes:
-                        error_detail = "ファイルが空です。画像を選び直してください。"
-                        flash(error_detail, "error")
-                except Exception as e:
-                    error_detail = f"画像読み込みエラー: {e}\n{traceback.format_exc()}"
-                    flash(f"画像読み込みエラー: {e}", "error")
-                    image_bytes = None
-
-                # Step 2: 画像圧縮
-                if image_bytes and not error_detail:
-                    try:
-                        comp = compress_image(image_bytes, filename)
-                        compression_info = comp
-                    except Exception as e:
-                        error_detail = f"画像圧縮エラー: {e}\n{traceback.format_exc()}"
-                        flash(f"画像圧縮エラー: {e}", "error")
-                        comp = None
-
-                # Step 3: 保存
-                if image_bytes and compression_info and not error_detail:
-                    try:
-                        ext = os.path.splitext(filename)[1].lower()
-                        if ext not in (".jpg", ".jpeg", ".png"):
-                            ext = ".jpg"
-                        save_name = f"receipt_{uuid.uuid4().hex[:8]}{ext}"
-                        save_path = os.path.join(UPLOAD_DIR, save_name)
-                        with open(save_path, "wb") as f:
-                            f.write(comp["bytes"])
-                    except Exception as e:
-                        error_detail = f"ファイル保存エラー: {e}\n{traceback.format_exc()}"
-                        flash(f"ファイル保存エラー: {e}", "error")
-                        save_path = None
-
-                # Step 4: OCR実行
-                if compression_info and not error_detail:
-                    try:
-                        ocr_result = ocr_receipt(comp["image"], save_path, image_bytes=comp["bytes"])
-                        ocr_result["saved_path"] = save_path if save_path else ""
-                        ocr_result["saved_name"] = save_name if save_path else ""
-                    except Exception as e:
-                        error_detail = f"OCRエラー: {e}\n{traceback.format_exc()}"
-                        flash(f"OCRエラー: {e}", "error")
+            # 複数選択対応: getlist で全ファイルを取得
+            files = [f for f in request.files.getlist("receipt_image") if f and f.filename]
+            if files:
+                for file in files:
+                    res = _process_receipt_file(file)
+                    results.append(res)
+                    if res["error"]:
+                        flash(f"{res['filename']}: {res['error_short']}", "error")
+                    else:
+                        flash(
+                            f"{res['filename']}: 読み取り完了"
+                            f"（{res['ocr_result']['store_name'] or '店舗不明'} / "
+                            f"{res['ocr_result']['total']:,}円）",
+                            "success",
+                        )
+                # 全件失敗した場合のみ、画面上部の大きなエラー枠に詳細を出す
+                if results and all(r["error"] for r in results):
+                    error_detail = results[0]["error"]
             else:
                 error_detail = "ファイルが選択されていません。"
                 flash("ファイルが選択されていません。", "error")
@@ -1755,13 +1869,31 @@ def receipt_page():
                 <div style="font-size:1.1rem; font-weight:600; margin:8px 0;">
                     クリックまたはドラッグ&ドロップ
                 </div>
-                <p>JPEG / PNG 対応 ・ 自動圧縮あり</p>
-                <input type="file" name="receipt_image" id="fileInput" accept="image/jpeg,image/png"
+                <p>JPEG / PNG / HEIC 対応 ・ 複数選択OK ・ 自動圧縮あり（HEICはJPEGへ自動変換）</p>
+                <input type="file" name="receipt_image" id="fileInput" multiple
+                       accept="image/jpeg,image/png,image/heic,image/heif,.heic,.heif"
                        style="display:none" onchange="document.getElementById('uploadForm').submit();">
             </div>
         </form>
     </div>
 
+    {% if results %}
+    <h2 style="margin-top:24px;">読み取り結果（{{ results|length }}件）</h2>
+    {% endif %}
+
+    {% for r in results %}
+    <div style="margin-bottom:8px;">
+        <div style="font-weight:600; margin:18px 0 8px; color:var(--primary); word-break:break-all;">
+            📄 {{ r.filename }}
+        </div>
+        {% if r.error %}
+        <div class="card" style="border-left:4px solid var(--warning); background:#FFF5F5;">
+            <strong style="color:var(--warning);">読み取りに失敗しました</strong>
+            <pre style="margin-top:6px; white-space:pre-wrap; color:#555; font-size:0.85rem; max-height:200px; overflow:auto;">{{ r.error }}</pre>
+        </div>
+        {% else %}
+        {% set compression_info = r.compression_info %}
+        {% set ocr_result = r.ocr_result %}
     {% if compression_info %}
     <div class="compression-info">
         📦 画像圧縮: {{ compression_info.format }} |
@@ -1774,8 +1906,6 @@ def receipt_page():
 
     {% if ocr_result %}
     <div class="card">
-        <h2>読み取り結果</h2>
-
         <!-- OCRモード表示 -->
         <div style="margin-bottom:12px; padding:8px 12px; background:var(--primary-light); border-radius:6px; font-size:0.85rem;">
             🔍 読取モード: <strong>{{ ocr_result.ocr_method }}</strong>
@@ -1891,6 +2021,9 @@ def receipt_page():
         <pre style="margin-top:12px; padding:12px; background:#F0F0F0; border-radius:6px; font-size:0.8rem; white-space:pre-wrap; max-height:300px; overflow:auto;">{{ ocr_result.raw_text }}</pre>
     </details>
     {% endif %}
+        {% endif %}
+    </div>
+    {% endfor %}
 
     <script>
     const dropZone = document.getElementById('dropZone');
@@ -1912,8 +2045,7 @@ def receipt_page():
         template,
         page_title="レシート読取",
         active_page="receipt",
-        ocr_result=ocr_result,
-        compression_info=compression_info,
+        results=results,
         error_detail=error_detail,
         categories=CATEGORIES,
     )

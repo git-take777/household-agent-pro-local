@@ -72,9 +72,17 @@ def parse_receipt_text(text: str) -> dict:
         "スターバックス": "スターバックス", "ドトール": "ドトール",
         "マクドナルド": "マクドナルド", "すき家": "すき家",
         "吉野家": "吉野家", "松屋": "松屋",
+        "丸亀製麺": "丸亀製麺", "丸亀": "丸亀製麺",
         "ガスト": "ガスト", "サイゼリヤ": "サイゼリヤ",
+        "バーミヤン": "バーミヤン", "ジョナサン": "ジョナサン",
+        "CoCo壱番屋": "CoCo壱番屋", "ココイチ": "CoCo壱番屋",
+        "かつや": "かつや", "天丼てんや": "天丼てんや",
+        "なか卯": "なか卯", "餃子の王将": "餃子の王将",
+        "日高屋": "日高屋", "幸楽苑": "幸楽苑",
+        "リンガーハット": "リンガーハット",
         "新時代": "新時代", "鳥貴族": "鳥貴族",
         "大戸屋": "大戸屋", "やよい軒": "やよい軒",
+        "磯丸水産": "磯丸水産",
         "マツモトキヨシ": "マツモトキヨシ", "ウエルシア": "ウエルシア",
         "サンドラッグ": "サンドラッグ", "ツルハ": "ツルハドラッグ",
         "ドン・キホーテ": "ドン・キホーテ",
@@ -120,12 +128,18 @@ def parse_receipt_text(text: str) -> dict:
                 break
 
     if not result["store_name"] and lines:
-        for line in lines[:5]:
-            if re.match(r"^[\d\s\-/:.TELtelFAXfax#T※]+$", line):
+        for line in lines[:7]:
+            if re.match(r"^[\d\s\-/:.TELtelFAXfax#T※〒]+$", line):
                 continue
-            if re.match(r"^(登録番号|レジ|TEL|FAX|電話)", line):
+            if re.match(r"^(登録番号|レジ|TEL|FAX|電話|〒|住所|領収)", line):
                 continue
-            if len(line) <= 2:
+            if len(line) <= 1:
+                continue
+            if re.match(r"^\d{2,4}[/\-年]\d{1,2}[/\-月]\d{1,2}", line):
+                continue
+            if re.match(r"^.{0,3}(都|道|府|県|市|区|町|村|郡)", line):
+                continue
+            if len(line) > 30:
                 continue
             result["store_name"] = line[:30]
             break
@@ -196,31 +210,82 @@ def parse_receipt_text(text: str) -> dict:
     ]
     yen_pattern = re.compile(r"[¥￥\\]\s*([0-9][0-9,]*)")
 
-    # 合計金額の検出
-    for line in lines:
-        if any(kw in line for kw in total_keywords):
-            yen_matches = yen_pattern.findall(line)
-            if yen_matches:
-                for m in yen_matches:
-                    try:
-                        val = int(m.replace(",", ""))
-                        if 10 <= val <= 999999:
-                            result["total"] = val
-                            break
-                    except ValueError:
-                        pass
-            else:
-                nums = re.findall(r"(\d[\d,]*)", line)
-                for n in nums:
-                    try:
-                        val = int(n.replace(",", ""))
-                        if 10 <= val <= 999999:
-                            result["total"] = val
-                            break
-                    except ValueError:
-                        pass
-        if result["total"]:
-            break
+    # 合計金額の検出（改善版: 「合計 ¥金額」パターン優先）
+    direct_total_pattern = re.compile(
+        r"(?:税込\s*)?合計\s*[¥￥\\]\s*([0-9][0-9,]*)"
+    )
+    total_candidates = []
+    priority_keywords_r = [
+        (1, ["税込合計", "税込 合計", "合計(税込)", "合計（税込）"]),
+        (2, ["合計", "合 計", "合　計", "合言十", "合訂"]),
+        (3, ["お支払", "お支払い", "請求額", "total", "TOTAL"]),
+        (5, ["小計", "小 計"]),
+    ]
+
+    for i, line in enumerate(lines):
+        if not any(kw in line for kw in total_keywords):
+            continue
+
+        # 優先度を決定
+        line_priority = 99
+        for pri, kws in priority_keywords_r:
+            if any(kw in line for kw in kws):
+                if pri == 2 and any(sk in line for sk in ["小計", "小 計"]):
+                    line_priority = min(line_priority, 5)
+                else:
+                    line_priority = min(line_priority, pri)
+                break
+
+        # 「合計 ¥金額」を直接検出（最優先）
+        dm = direct_total_pattern.search(line)
+        if dm:
+            try:
+                val = int(dm.group(1).replace(",", ""))
+                if 10 <= val <= 999999:
+                    total_candidates.append((line_priority, "direct", val))
+                    continue
+            except ValueError:
+                pass
+
+        # ¥付き金額
+        yen_matches = yen_pattern.findall(line)
+        if yen_matches:
+            for m in yen_matches:
+                try:
+                    val = int(m.replace(",", ""))
+                    if 10 <= val <= 999999:
+                        total_candidates.append((line_priority, "yen", val))
+                except ValueError:
+                    pass
+        else:
+            nums = re.findall(r"(\d[\d,]*)", line)
+            for n in nums:
+                try:
+                    val = int(n.replace(",", ""))
+                    if 10 <= val <= 999999:
+                        total_candidates.append((line_priority + 10, "num", val))
+                except ValueError:
+                    pass
+            # 次の行に¥金額がある場合
+            if not nums and i + 1 < len(lines):
+                next_yen = yen_pattern.findall(lines[i + 1])
+                if next_yen:
+                    for m in next_yen:
+                        try:
+                            val = int(m.replace(",", ""))
+                            if 10 <= val <= 999999:
+                                total_candidates.append((line_priority, "next", val))
+                        except ValueError:
+                            pass
+
+    if total_candidates:
+        best_priority = min(c[0] for c in total_candidates)
+        best = [c for c in total_candidates if c[0] == best_priority]
+        direct = [c for c in best if c[1] == "direct"]
+        if direct:
+            result["total"] = direct[-1][2]
+        else:
+            result["total"] = best[-1][2]
 
     # 品目の抽出
     line_amount_pattern = re.compile(r"(.+?)\s+[¥￥\\]?\s*([0-9][0-9,]*)\s*$")
@@ -310,8 +375,16 @@ def _guess_category(store_name: str, items: list, full_text: str = "") -> str:
         "スターバックス": "外食費", "ドトール": "外食費",
         "マクドナルド": "外食費", "すき家": "外食費",
         "吉野家": "外食費", "松屋": "外食費",
+        "丸亀製麺": "外食費",
         "ガスト": "外食費", "サイゼリヤ": "外食費",
+        "バーミヤン": "外食費", "ジョナサン": "外食費",
+        "CoCo壱番屋": "外食費", "かつや": "外食費",
+        "天丼てんや": "外食費", "なか卯": "外食費",
+        "餃子の王将": "外食費", "日高屋": "外食費",
+        "幸楽苑": "外食費", "リンガーハット": "外食費",
         "新時代": "外食費", "鳥貴族": "外食費",
+        "磯丸水産": "外食費",
+        "大戸屋": "外食費", "やよい軒": "外食費",
         "マツモトキヨシ": "日用品", "ウエルシア": "日用品",
         "サンドラッグ": "日用品", "ツルハ": "日用品",
         "ヤマダ電機": "家電購入", "ビックカメラ": "家電購入",
